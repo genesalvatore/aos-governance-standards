@@ -1952,7 +1952,7 @@ The following axioms are foundational to the DPG architecture. Every design deci
 
 **Axiom 4: Every bypass path is a vulnerability.** If any side effect can occur without passing through the gate, the entire system is compromised. Security is binary — the gate either governs ALL side effects or it governs none. A gate that covers 99% of side effect paths provides 0% security because the attacker will use the 1%.
 
-**Axiom 5: The cost of false DENY is always less than the cost of false ALLOW.** A false denial inconveniences the operator. A false allow compromises the system. Every design decision in this standard resolves ambiguity in favor of DENY.
+**Axiom 5: The cost of false DENY is always less than the cost of false ALLOW.** A false denial inconveniences the operator. A false allow compromises the system. Every design decision in this standard resolves ambiguity in favor of DENY. (For deployments where this axiom does not hold — such as real-time safety systems where blocking an action is itself dangerous — see Condition 2, Section 1.4. The DPG is the wrong architecture for those deployments.)
 
 **Axiom 6: Audit is not optional.** Without the journal, there is no evidence that the gate functioned correctly, no ability to detect policy gaps, and no forensic capability after an incident. The journal is not a logging convenience — it is a security control. That is why journal write failure triggers fail-closed (Section 4.3, Step 9).
 
