@@ -1743,6 +1743,8 @@ All Foundation tests PLUS:
 | E-016 | Policy update without admin signature (R-POL-010) | Update rejected |
 | E-017 | Multi-tenant: Agent A request evaluated against Agent A policy only (R-ARCH-013) | Correct policy used |
 | E-018 | Unicode path normalization: NFC vs NFD equivalent paths (R-ENF-020) | Same canonical path |
+| E-019 | Gate binary with invalid publisher signature (R-GATE-001) | Gate refuses to start |
+| E-020 | Attestation record deleted while journal entry exists (R-ATT-015) | Alert emitted; audit trail degradation detected |
 
 ### 11.3 Sovereign Tier Tests
 
@@ -1758,6 +1760,8 @@ All Foundation and Enterprise tests PLUS:
 | S-006 | Formal verification model covers enforcement pipeline steps 1-11 | Model verified, no bypass states found |
 | S-007 | Emergency re-keying procedure (R-ATT-012) | Gate locks, re-keys, recovers with signed token |
 | S-008 | Recovery from LOCKED mode requires signed token (R-ARCH-017) | Unsigned recovery rejected |
+| S-009 | Gate binary hash mismatch at startup (R-GATE-003) | Gate refuses to start; CRITICAL alert emitted |
+| S-010 | Reproducible build: rebuild from source matches published hash (R-GATE-002) | Bit-identical binary produced |
 
 ### 11.4 Test Procedures
 
@@ -2537,7 +2541,7 @@ This standard is published under [CC-BY-4.0](https://creativecommons.org/license
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release, converted from AOS-PATENT-015 |
-| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-015), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-018, S-007–S-008) and test procedures (Section 11.4). |
+| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-015), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-020, S-007–S-010) and test procedures (Section 11.4). Fixed trust model table structure and section ordering. |
 
 ---
 
