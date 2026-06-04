@@ -135,7 +135,7 @@ The mission declaration is documentation that accompanies the policy for human r
 
 This is the **Least Privilege Principle** applied to agent governance: if the agent doesn't need it, the agent doesn't get it.
 
-> **IMPORTANT:** Before authoring a policy, verify that the deployment is suitable for agent operation. AOS-CORE-001 Section 1.4 defines five conditions under which no policy configuration is sufficient — including unpartitioned tripartite access (read untrusted + hold sensitive + write outward), catastrophic false-DENY risk, and unqualified supervision. If any of these conditions apply, resolve them architecturally before proceeding with policy authoring.
+> **IMPORTANT:** Before authoring a policy, verify that the deployment is suitable for agent operation. AOS-CORE-001 Section 1.4 defines six conditions under which no policy configuration is sufficient — including unpartitioned tripartite access, catastrophic false-DENY risk, unqualified supervision, and vulnerable population interaction without content safeguards. If any of these conditions apply, resolve them architecturally before proceeding with policy authoring.
 
 ### 4.3 Policy Format
 
