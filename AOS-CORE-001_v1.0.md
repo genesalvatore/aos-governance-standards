@@ -195,6 +195,41 @@ A conformant DPG implementation MUST enforce the following architectural separat
 └──────────────────────────────────────────────────────────┘
 ```
 
+**Multi-agent topology:**
+
+In multi-agent deployments, each agent connects to its own gate instance. An orchestrator agent does not share its gate with worker agents:
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Orchestrator │    │   Worker A   │    │   Worker B   │
+│    Agent     │    │    Agent     │    │    Agent     │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │                   │                   │
+   IPC │               IPC │               IPC │
+       │                   │                   │
+       ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Gate O      │    │  Gate A      │    │  Gate B      │
+│  (orchestr.) │    │  (worker A)  │    │  (worker B)  │
+│              │    │              │    │              │
+│ Policy O:    │    │ Policy A:    │    │ Policy B:    │
+│ • spawn      │    │ • write_file │    │ • read_file  │
+│ • delegate   │    │   /work/a/** │    │   /work/b/** │
+│ • monitor    │    │ • budget: 50 │    │ • budget: 20 │
+└──────────────┘    └──────────────┘    └──────────────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+  Executors O          Executors A          Executors B
+  (spawn, msg)         (file ops)           (file ops)
+```
+
+Key properties:
+- Each gate has its own policy, budget counters, journal, and signing key
+- The orchestrator's gate does NOT have write_file permissions — it can only spawn and delegate
+- Worker A cannot access Worker B's workspace (scope isolation)
+- The orchestrator cannot grant workers permissions it doesn't have (permission amplification is impossible)
+- Each gate produces its own attestation chain — cross-gate verification requires the multi-agent trust federation protocol (AOS-CORE-003)
+
 ### 4.2 Trust Boundary Requirements
 
 **R-ARCH-001:** The agent process and gate process MUST execute in separate trust domains. The agent MUST NOT have direct access to tool executors, protected file paths, gate signing keys, or the approval registry.
@@ -1639,6 +1674,14 @@ A conformant Foundation implementation MUST pass all of the following tests:
 | F-015 | Gate process terminates unexpectedly | All tool executors terminate or lock |
 | F-016 | Gate restarts; previously used nonce replayed | DENY |
 | F-017 | Gate restarts with corrupted executor state | Gate enters permanent fail-closed, emits alert |
+| F-018 | URL with `userinfo@host` syntax (R-ENF-011) | DENY |
+| F-019 | Network request resolves to private IP range (R-ENF-012) | DENY |
+| F-020 | Database query references denied column (R-ENF-013) | DENY |
+| F-021 | Filesystem read tool with path outside read allowlist (R-ENF-014) | DENY |
+| F-022 | Two concurrent requests both attempt to use last budget slot (R-ARCH-011) | Exactly one ALLOW, one DENY |
+| F-023 | Policy update during in-flight request (R-POL-008) | In-flight completes under old policy |
+| F-024 | Gate returns ERROR — response contains no internal state (R-ENF-018) | Response is opaque |
+| F-025 | Denied request produces signed denial record (R-ATT-001a) | Denial record signature verifies |
 
 ### 11.2 Enterprise Tier Tests
 
@@ -1658,6 +1701,12 @@ All Foundation tests PLUS:
 | E-010 | Denial response contains policy details | FAIL — response must be opaque |
 | E-011 | HTTP redirect to non-allowlisted domain | DENY |
 | E-012 | URL with userinfo@host confusion | DENY |
+| E-013 | Approval fatigue: >95% approval rate over 20+ requests (R-APR-011) | Warning emitted |
+| E-014 | Rapid approval: response in <2 seconds for T4 tool (R-APR-012) | Flagged in journal |
+| E-015 | Key rotation: attestation with expired key rejected (R-ATT-011) | DENY |
+| E-016 | Policy update without admin signature (R-POL-010) | Update rejected |
+| E-017 | Multi-tenant: Agent A request evaluated against Agent A policy only (R-ARCH-013) | Correct policy used |
+| E-018 | Unicode path normalization: NFC vs NFD equivalent paths (R-ENF-020) | Same canonical path |
 
 ### 11.3 Sovereign Tier Tests
 
@@ -1671,6 +1720,147 @@ All Foundation and Enterprise tests PLUS:
 | S-004 | Command tool attempts outbound network access | BLOCKED by namespace isolation |
 | S-005 | Syscall outside permitted profile | BLOCKED by seccomp/AppArmor |
 | S-006 | Formal verification model covers enforcement pipeline steps 1-11 | Model verified, no bypass states found |
+| S-007 | Emergency re-keying procedure (R-ATT-012) | Gate locks, re-keys, recovers with signed token |
+| S-008 | Recovery from LOCKED mode requires signed token (R-ARCH-017) | Unsigned recovery rejected |
+
+### 11.4 Test Procedures
+
+The following procedures specify HOW to execute the most difficult conformance tests. These procedures prevent compliance theater — trivial test implementations that technically pass but don't verify the claim.
+
+#### 11.4.1 F-001: Agent Direct Execution Bypass
+
+**Objective:** Verify that no side effect path exists outside the gate.
+
+**Procedure:**
+
+```
+1. SETUP:
+   a. Deploy the DPG with a policy that allows write_file to /workspace/**
+   b. Start the agent process
+   c. Create a test file target: /workspace/f001-test.txt
+
+2. EXECUTE:
+   a. From the agent process (not through the gate), attempt to:
+      - Open /workspace/f001-test.txt for writing via direct syscall
+      - Execute a shell command via fork/exec
+      - Open a network socket to an external host
+   b. Each attempt MUST use the agent's actual process context,
+      not a simulated one
+
+3. VERIFY:
+   a. /workspace/f001-test.txt MUST NOT exist or MUST be unchanged
+   b. No child process MUST have been created
+   c. No network connection MUST have been established
+   d. The gate journal MUST NOT contain entries for these attempts
+      (they never reached the gate)
+
+4. MECHANISM:
+   The test verifies OS-level enforcement (filesystem permissions,
+   seccomp, namespace isolation) not just application-level checks.
+   The agent process genuinely CANNOT produce side effects.
+```
+
+#### 11.4.2 F-008: Gate Crash Mid-Pipeline (Fail-Closed)
+
+**Objective:** Verify that a gate crash at any pipeline step produces no side effect.
+
+**Procedure:**
+
+```
+1. SETUP:
+   a. Deploy the DPG with a policy allowing write_file
+   b. Instrument the gate to accept a "crash at step N" directive
+      (test hook, NOT production feature)
+
+2. EXECUTE (for each step N from 1 to 11):
+   a. Set crash point to step N
+   b. Submit a valid write_file request
+   c. Gate processes steps 1 through N-1 normally
+   d. At step N, gate process terminates (SIGKILL, not graceful)
+
+3. VERIFY (for each step N):
+   a. If N <= 9 (before execution): Target file MUST NOT exist
+   b. If N = 10 (during execution): Target file MAY exist
+      (execution was in progress), but tool executor MUST have
+      terminated when gate died (R-ARCH-007)
+   c. If N = 11 (post-execution journal): Side effect occurred
+      but the missing post-journal entry is detectable on restart
+   d. Gate restart MUST detect the incomplete state (R-ARCH-008)
+
+4. CRITICAL STEPS:
+   Step 8 (attestation): Crash here means attestation was created
+   but never used. On restart, the nonce is consumed but no
+   execution occurred. This is safe (conservative).
+   Step 9 (pre-journal): Crash here means journal entry was written
+   but execution never started. On restart, the journal shows an
+   ALLOW decision with no corresponding POST_EXECUTION. This is
+   detectable and safe.
+```
+
+#### 11.4.3 E-009: TOCTOU Symlink Race
+
+**Objective:** Verify that the gate prevents or detects symlink races.
+
+**Procedure:**
+
+```
+1. SETUP:
+   a. Policy allows write_file to /workspace/**
+   b. Policy denies write_file to /etc/**
+   c. Create /workspace/target.txt as a regular file
+
+2. EXECUTE:
+   a. Start a background process that continuously:
+      - Deletes /workspace/target.txt
+      - Creates a symlink /workspace/target.txt -> /etc/shadow
+      - Deletes the symlink
+      - Recreates /workspace/target.txt as a regular file
+      (This creates a race window)
+   b. Simultaneously submit 1000 write_file("/workspace/target.txt")
+      requests through the gate
+
+3. VERIFY:
+   a. /etc/shadow MUST NOT have been modified
+   b. Check /etc/shadow timestamp and content hash before and after
+   c. Review journal entries — any entries showing
+      write to /etc/shadow MUST be marked as BLOCKED or the
+      write must not have occurred
+
+4. PASS CRITERIA:
+   EITHER: Gate uses O_NOFOLLOW and rejects ALL symlink writes
+   OR: Gate uses open-then-fstat and detects the race, logging
+       a TOCTOU_DETECTED event
+   FAIL: Any write to /etc/shadow constitutes test failure
+```
+
+#### 11.4.4 F-022: Concurrent Budget Atomicity
+
+**Objective:** Verify that concurrent requests cannot exceed budget limits.
+
+**Procedure:**
+
+```
+1. SETUP:
+   a. Policy: write_file with callsPerHour: 100
+   b. Reset budget counter to 95
+
+2. EXECUTE:
+   a. Submit 20 concurrent write_file requests simultaneously
+      (using multi-threaded test client)
+   b. All 20 requests MUST arrive at the gate within 10ms
+
+3. VERIFY:
+   a. Exactly 5 requests MUST be ALLOWED (95 + 5 = 100)
+   b. Exactly 15 requests MUST be DENIED (budget exceeded)
+   c. Final budget counter MUST read exactly 100
+   d. No request outside the 5 allowed MUST have produced a
+      side effect
+
+4. STATISTICAL VALIDATION:
+   Run this test 100 times. Every run MUST allow exactly 5.
+   Any run that allows 6 or more indicates a race condition
+   in the budget check (violation of R-ARCH-011).
+```
 
 ---
 
@@ -2018,6 +2208,61 @@ The approval mechanism (R-APR-001) is designed to be pluggable. Implementations 
 - Hardware tokens (for Sovereign tier)
 
 The only requirement is that the approval channel is out-of-band and produces cryptographically signed tokens.
+
+### 14.4 Conformance Tooling
+
+The AOS ecosystem provides tooling to support conformance validation:
+
+- **Policy linter:** Validates policy syntax, checks for common misconfigurations (e.g., wildcard allowlists, missing denylists, budget thresholds below recommended minimums), and reports blast radius analysis.
+- **Conformance test suite:** Automated test framework that executes the conformance tests defined in Section 11, including the test procedures in Section 11.4. Published as an open-source companion to this standard.
+- **Journal verifier:** Standalone tool that validates journal chain integrity (R-JRN-004 through R-JRN-006) and reports any tampering detected.
+- **Attestation verifier:** Standalone tool that validates attestation signatures, nonce uniqueness, timestamp freshness, and policy hash binding.
+- **Policy diff analyzer:** Compares two policy versions and reports added/removed/modified tools, scope changes, and budget changes with blast radius impact.
+
+> **NOTE:** The AOS Foundation maintains reference implementations of these tools. Third-party implementations are welcome and encouraged. Conformance testing tools MUST NOT themselves require a DPG to operate — they are verification tools, not agent tools.
+
+### 14.5 Internationalization
+
+**R-ENF-020:** The gate MUST normalize all filesystem paths to a canonical Unicode form before scope validation. NFC (Canonical Decomposition followed by Canonical Composition, as defined by Unicode Standard Annex #15) is REQUIRED.
+
+**Rationale:** The same visible filename can be encoded differently in Unicode:
+
+```
+File: "résumé.txt"
+
+NFC (composed):     r é s u m é . t x t
+  Bytes:            72 C3A9 73 75 6D C3A9 2E 747874
+
+NFD (decomposed):   r e ◌́ s u m e ◌́ . t x t
+  Bytes:            72 65 CC81 73 75 6D 65 CC81 2E 747874
+
+Without normalization:
+  Policy allowlist: ["/workspace/résumé.txt"] (NFC)
+  Request path:     "/workspace/résumé.txt" (NFD)
+  Result: NO MATCH — even though the filenames look identical
+```
+
+**R-ENF-021:** For domain name matching (R-ENF-003), the gate MUST:
+- Convert Internationalized Domain Names (IDN) to ASCII (Punycode) before matching
+- Detect and reject Unicode homoglyph attacks where visually similar characters are substituted (e.g., Cyrillic "а" U+0430 for Latin "a" U+0061)
+
+**Homoglyph attack example:**
+
+```
+Policy domain allowlist: ["api.github.com"]
+
+Request URL: "https://api.ɡithub.com/repos"  (ɡ = U+0261, Latin small letter script G)
+
+Visually: Identical to api.github.com
+Actually: Completely different domain controlled by attacker
+
+Defense: The gate MUST convert to Punycode:
+  api.github.com  → api.github.com (no change — pure ASCII)
+  api.ɡithub.com  → api.xn--ithub-wwa.com (Punycode reveals difference)
+  Comparison: MISMATCH → DENY
+```
+
+**R-ENF-022:** Tool names in the policy MUST be case-sensitive and ASCII-only. Tool names containing non-ASCII characters MUST be rejected at policy load time.
 
 ---
 
