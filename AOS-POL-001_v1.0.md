@@ -135,6 +135,8 @@ The mission declaration is documentation that accompanies the policy for human r
 
 This is the **Least Privilege Principle** applied to agent governance: if the agent doesn't need it, the agent doesn't get it.
 
+> **IMPORTANT:** Before authoring a policy, verify that the deployment is suitable for agent operation. AOS-CORE-001 Section 1.4 defines five conditions under which no policy configuration is sufficient — including unpartitioned tripartite access (read untrusted + hold sensitive + write outward), catastrophic false-DENY risk, and unqualified supervision. If any of these conditions apply, resolve them architecturally before proceeding with policy authoring.
+
 ### 4.3 Policy Format
 
 **R-POL-A-023:** The policy format is implementation-specific per AOS-CORE-001 Section 13.4. YAML is RECOMMENDED for human-authored policies due to readability. JSON is RECOMMENDED for machine-generated or programmatically composed policies. Regardless of format, the policy MUST be convertible to a canonical form for hash computation (AOS-CORE-001 R-POL-003).
@@ -2602,7 +2604,7 @@ For policy authors who need to make fast decisions, this matrix provides default
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release |
-| 1.0.1 | 2026-06-04 | Added: incident response playbooks (Section 13.5), greenfield adoption guide (Section 14.0), tier-level alignment matrix (Section 17.2), permission amplification worked example (Section 11.1), cross-standard version compatibility (Section 17.1), column-level read scope in financial template (Section 10.3), glossary cross-reference to CORE-001. Status changed from Draft to Published. |
+| 1.0.1 | 2026-06-04 | Added: incident response playbooks (Section 13.5), greenfield adoption guide (Section 14.0), tier-level alignment matrix (Section 17.2), permission amplification worked example (Section 11.1), cross-standard version compatibility (Section 17.1), column-level read scope in financial template (Section 10.3), glossary cross-reference to CORE-001, deployment suitability cross-reference (Section 4.2, referencing AOS-CORE-001 Section 1.4). Status changed from Draft to Published. |
 
 ---
 

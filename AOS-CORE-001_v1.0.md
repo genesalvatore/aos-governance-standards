@@ -99,7 +99,25 @@ This standard applies to any system in which an AI agent (or multi-agent system)
 
 While this standard is designed for AI agents, its enforcement model MAY be applied to any automated system that produces side effects, including non-AI workflow engines, scripted automation, and hybrid human-AI systems.
 
-### 1.4 Versioning
+### 1.4 Deployment Suitability
+
+This standard governs the enforcement boundary for AI agents that produce side effects. **It does not assert that all AI agent deployments are appropriate.** A conformant gate does not make an inherently unsafe deployment safe — it makes a *suitable* deployment *enforceable*.
+
+Before implementing a DPG, organizations MUST assess whether the deployment is suitable for autonomous or semi-autonomous agent operation. The following conditions indicate that **no policy configuration is sufficient** and the deployment SHOULD NOT proceed without fundamental architectural changes:
+
+**Condition 1: Unpartitioned tripartite access.** The agent simultaneously (a) reads untrusted external content, (b) holds access to sensitive or regulated data, AND (c) has outward-facing write or communication tools — with no architectural compartmentalization between these capabilities. This is the "pick two" problem: an agent that does all three without isolation creates exfiltration paths that the DPG cannot fully govern (see Section 12.4, steganographic exfiltration). **Mitigation:** Decompose into two or more agents with separate gate instances and non-overlapping scope — one that reads untrusted content with no access to sensitive data, and one that accesses sensitive data with no outward-facing write tools.
+
+**Condition 2: Catastrophic false-DENY risk.** The agent operates in a domain where a false DENY (the gate incorrectly blocking a legitimate action) produces harm comparable to or exceeding the harm of a false ALLOW. Examples: autonomous emergency medical intervention where blocking a treatment decision endangers a patient; autonomous vehicle navigation where blocking a steering correction causes a collision; real-time safety systems where enforcement latency is itself a hazard. The DPG's design axiom (Axiom 5) is that the cost of false DENY is always less than false ALLOW. **If this axiom does not hold for your deployment, the DPG is the wrong architecture.**
+
+**Condition 3: Unqualified supervision.** No human in the approval chain understands the agent's operations well enough to make meaningful approval decisions. If the approver cannot evaluate whether `run_command("kubectl apply -f deployment.yaml")` is safe, the approval mechanism provides no security value — it provides only compliance theater (see Section 8.2, approval presentation requirements). Approval without comprehension is not governance. It is liability transfer.
+
+**Condition 4: Unbounded blast radius.** The maximum credible damage from a single compromised agent session exceeds the organization's capacity to detect, respond to, and recover from the incident. If one session can cause irreversible harm that exceeds the organization's incident response capability — financial loss beyond insurance coverage, data exposure beyond notification capacity, reputational damage beyond recovery — the agent should not have those permissions regardless of the policy configuration.
+
+**Condition 5: Unclassifiable harm categories.** The deployment domain contains categories of harm that cannot be reliably classified by any available mechanism (rule-based, ML-based, or human review). If the organization cannot define its prohibited categories with sufficient precision that a classifier can enforce them with acceptable false-negative rates, the category enforcement layer (R-ENF-008) provides no meaningful protection.
+
+> **NOTE:** These conditions are not theoretical. They represent deployment patterns observed in production AI failures. An organization that proceeds despite one or more of these conditions has not failed to implement the standard — it has failed to apply the standard's own risk analysis to its deployment decision. A governance standard that does not tell you when NOT to deploy is incomplete. This section exists to be complete.
+
+### 1.5 Versioning
 
 This standard uses semantic versioning (MAJOR.MINOR). Minor versions add optional capabilities without breaking conformance. Major versions may add or modify mandatory requirements. Implementations conformant to version X.Y remain conformant to all subsequent X.* versions. Deprecated requirements will be marked in the revision history with a minimum 12-month notice period before removal.
 
@@ -2541,7 +2559,7 @@ This standard is published under [CC-BY-4.0](https://creativecommons.org/license
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release, converted from AOS-PATENT-015 |
-| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-015), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-020, S-007–S-010) and test procedures (Section 11.4). Fixed trust model table structure and section ordering. |
+| 1.0.1 | 2026-06-04 | Added: deployment suitability assessment (Section 1.4 — five conditions under which no policy is sufficient), gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-015), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-020, S-007–S-010) and test procedures (Section 11.4). Fixed trust model table structure and section ordering. |
 
 ---
 
