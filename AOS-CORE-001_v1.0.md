@@ -5,7 +5,7 @@ version: "1.0"
 title: "Deterministic Policy Gate"
 heritage_id: AOS-PATENT-015
 provisional_ref: "63/957,869 (filed Jan 10, 2026)"
-status: Draft
+status: Published
 category: CORE
 published: 2026-06-03
 publisher: AOS Foundation
@@ -588,6 +588,23 @@ The enforcement pipeline adds latency to every tool call. Implementations MUST b
 
 **Total overhead (excluding Step 7 and 10):** Typically 15–520ms per tool call, dominated by category classification.
 
+#### 4.5.1 Performance Targets
+
+The following targets are RECOMMENDED for a reference configuration (single agent, 4-core CPU, SSD storage, no HSM):
+
+| Metric | Target | Rationale |
+|--------|--------|----------|
+| Authorization latency (p50) | < 25ms | Steps 1–6 without classifier |
+| Authorization latency (p95) | < 200ms | Steps 1–6 with ML classifier |
+| Authorization latency (p99) | < 500ms | Worst-case classifier + cold cache |
+| Attestation creation (p50) | < 3ms | Ed25519 or ECDSA P-256 |
+| Journal write (p50) | < 5ms | Buffered fsync |
+| Total pipeline (p50) | < 35ms | Steps 1–9 + 11, excluding tool execution |
+| Total pipeline (p99) | < 800ms | Worst case, excluding tool execution |
+| Throughput | > 200 req/sec | Concurrent requests on reference hardware |
+
+These targets are informative. Implementations SHOULD publish their own benchmarks using the methodology above. Conformance does not require meeting these targets — it requires completing the pipeline correctly.
+
 **R-ARCH-009:** The gate MUST complete steps 1–6 (authorization decision) within a configurable timeout. The default authorization timeout MUST NOT exceed 10 seconds. If the authorization decision cannot be completed within the timeout, the gate MUST DENY the request.
 
 **R-ARCH-010:** Gate implementations SHOULD report per-step latency metrics to enable operators to identify performance bottlenecks. At the Enterprise and Sovereign tiers, per-step latency logging is REQUIRED.
@@ -754,7 +771,9 @@ Dangerous alternative (DO NOT implement):
 
 **R-ENF-001:** For filesystem tools, the gate MUST resolve requested paths to canonical absolute paths before evaluation. Relative paths, symbolic links, and encoded traversals MUST be resolved before allowlist/denylist matching. Path resolution and subsequent file operations MUST be performed atomically (e.g., open-then-fstat pattern, `O_NOFOLLOW`) to prevent time-of-check-to-time-of-use (TOCTOU) race conditions.
 
-**R-ENF-002:** Denylists MUST be evaluated before allowlists. A path matching any denylist pattern MUST be denied regardless of allowlist matches.
+**R-ENF-002:** Denylists MUST take absolute precedence over allowlists in ALL scope validation contexts — filesystem, network, database, and command execution. If a resource matches both an allowlist entry and a denylist entry, the gate MUST DENY. This is the **principle of restrictive composition**: any explicit prohibition overrides any explicit permission. Denylists MUST be evaluated before allowlists to enable short-circuit denial.
+
+> **Rationale:** Without explicit precedence, two conformant implementations may produce different enforcement decisions for the same request. Restrictive composition ensures that adding a denylist entry can NEVER be overridden by an allowlist entry, which is the only safe default.
 
 **R-ENF-003:** For network tools, the gate MUST validate the target URL against the domain allowlist and protocol restrictions using a standards-compliant URL parser (RFC 3986). Internationalized domain names MUST be converted to ASCII (Punycode) before matching. URL authority components MUST be validated to prevent parser confusion attacks (e.g., userinfo@host ambiguity). The gate MUST NOT follow HTTP redirects unless the redirect target also matches the domain allowlist.
 
@@ -908,6 +927,15 @@ Result: DENY (SCOPE_VIOLATION)
 **R-ENF-005:** The gate MUST maintain counters for per-tool and global resource budgets. Counters MUST be checked before execution and incremented after successful execution. Budget counter increments MUST be durable — the counter MUST be persisted before the tool executor begins execution. If the gate crashes, upon restart the counter MUST reflect all attempted executions, not just successfully completed ones.
 
 > **NOTE:** The counter reflects attempted executions, not only successful completions. This is intentional: budget limits protect against all resource consumption, including failed attempts.
+
+**R-ENF-005a:** Budget windows MUST use **sliding windows** (trailing N minutes/hours) by default. Fixed windows (aligned to clock boundaries, e.g., top of each hour) are permitted when explicitly declared in the policy via a `windowType: "fixed"` field.
+
+| Window Type | Behavior | Trade-off |
+|------------|----------|----------|
+| **Sliding** (default) | `callsPerHour` counts calls in the trailing 60 minutes from the current instant | More consistent enforcement; prevents burst-at-boundary exploits; higher memory cost |
+| **Fixed** | `callsPerHour` resets at the top of each clock hour (UTC) | Simpler implementation; allows burst at window boundaries (agent makes 100 calls at 12:59, counter resets at 13:00, agent makes 100 more calls at 13:01) |
+
+> **WARNING:** Fixed windows create a burst vulnerability. An agent can consume its full budget at the end of one window AND the beginning of the next, effectively doubling its throughput. Sliding windows eliminate this. Implementations using fixed windows SHOULD document this limitation.
 
 **R-ENF-006:** Budget windows MUST reset automatically at the configured interval (e.g., hourly, daily). The gate MUST NOT allow counter manipulation by the agent.
 
@@ -1188,6 +1216,10 @@ Attestation is the cryptographic mechanism that makes gate decisions auditable a
 
 **R-ATT-009:** The nonce registry MUST persist across gate restarts. Used nonces MUST be retained for at least the duration of the freshness window (R-ATT-008). At the Enterprise and Sovereign tiers, the nonce registry MUST be stored in durable, append-only storage.
 
+**R-ATT-010:** Attestation records MUST be retained for at least as long as the corresponding journal entries. If an attestation record is deleted while the corresponding journal entry exists, the journal's reference to the attestation becomes unverifiable, degrading the audit trail. Implementations MUST NOT implement separate, shorter retention periods for attestation records.
+
+> **Rationale:** The journal stores argument hashes that reference attestation records (R-JRN-007). If the attestation is deleted, the hash in the journal cannot be verified against the original arguments. The journal becomes a list of unverifiable claims. This defeats the purpose of the attestation system.
+
 ### 7.3 Attestation Verification Walkthrough
 
 The following walkthrough demonstrates the complete verification process for a single attestation:
@@ -1345,7 +1377,9 @@ Human approval is the only component of the DPG where a human directly participa
 
 ### 8.1 Approval Flow
 
-**R-APR-001:** Tools marked `approvalRequired: true` in the policy MUST NOT execute without explicit human approval. The gate MUST pause execution, present the proposed action to an authorized approver, and wait for a signed response.
+**R-APR-001:** Tools marked `approvalRequired: true` in the policy MUST NOT execute without an explicit, out-of-band human approval.
+
+> **NOTE:** Approval interfaces — whether web-based, mobile, or messaging-based — SHOULD conform to WCAG 2.1 Level AA accessibility guidelines to ensure that approvers with visual, motor, or cognitive impairments can review and respond to approval requests. At minimum, approval request displays MUST be screen-reader compatible and MUST NOT rely solely on color to convey information (e.g., red/green status indicators MUST include text labels). The gate MUST pause execution, present the proposed action to an authorized approver, and wait for a signed response.
 
 **R-APR-002:** The approval channel MUST be out-of-band — the agent MUST NOT be able to access, intercept, or influence the approval mechanism.
 
@@ -1873,7 +1907,19 @@ A conformant DPG implementation assumes the following trust hierarchy:
 | Component | Trust Level | Justification |
 |-----------|-------------|---------------|
 | **Operating system kernel** | Trusted | The kernel enforces process isolation, memory protection, and file permissions that the gate relies on. At Sovereign tier, kernel trust is verified through hardware attestation. |
-| **Gate process** | Trusted but constrained | The gate is trusted to make correct enforcement decisions, but it operates under the principle of least privilege. It has access only to the signing key, the policy, the journal, and the tool executors. It has no access to the agent's memory, context, or model weights. |
+| **Gate process** | Trusted but constrained | The gate is trusted to make correct enforcement decisions, but it operates under the principle of least privilege. It has access only to the signing key, the policy, the journal, and the tool executors. It has no access to the agent's memory, context, or model weights. At Enterprise tier and above, gate binary integrity MUST be verified (R-GATE-001). |
+
+#### 12.1.2 Gate Supply Chain Integrity
+
+The gate is the single root of trust in the DPG architecture. A compromised gate binary renders all enforcement, attestation, and journaling untrustworthy. The following requirements protect the gate itself:
+
+**R-GATE-001 (Enterprise+):** The gate binary MUST be cryptographically signed by the publisher. Before starting the gate, the deployment system MUST verify the binary signature against a pinned publisher key. An unsigned or incorrectly signed binary MUST NOT be executed.
+
+**R-GATE-002 (Sovereign):** The gate MUST support reproducible builds. Given the same source code and build environment, any party MUST be able to produce a bit-identical binary and verify it against the published hash. This enables independent verification that the distributed binary matches the audited source.
+
+**R-GATE-003 (Sovereign):** At startup, the gate MUST perform a self-integrity check by computing and verifying its own binary hash against a trusted reference. If the hash does not match, the gate MUST refuse to start and MUST emit a CRITICAL alert. On platforms supporting Trusted Platform Module (TPM) or equivalent hardware attestation, the gate's binary hash MUST be included in the measured boot chain.
+
+> **NOTE:** Gate supply chain integrity is complementary to, not a substitute for, the OS kernel trust assumption. If the kernel is compromised, the attacker can tamper with the gate between verification and execution. Sovereign tier hardware attestation (measured boot) addresses this gap.
 | **Policy** | Trusted if integrity passes | The policy is trusted only after the integrity hash is verified (R-POL-003). A policy that fails verification is treated as tampered — the gate refuses to start. |
 | **Tool executors** | Trusted but sandboxed | Executors are within the gate boundary but are sandboxed (Enterprise+, R-ENT-002) to limit the impact of executor compromise. |
 | **Agent process** | **UNTRUSTED** | The agent is the primary threat actor. It may be compromised through prompt injection, context poisoning, fine-tuning attacks, or supply chain compromise. The entire DPG architecture exists because the agent cannot be trusted. |
@@ -2033,9 +2079,35 @@ This standard does NOT address:
 | Content-level text evaluation | DPG evaluates tool calls, not generated text | Complementary content filtering systems |
 | Multi-agent trust federation across organizations | Requires cross-boundary trust protocols | AOS-CORE-003 (companion standard) |
 | Covert channel attacks (timing, resource) | Side channels do not produce explicit side effects | NIST SP 800-53 SC-4; Sovereign tier behavioral monitoring |
+| **Steganographic exfiltration** | An agent reads permitted data, then encodes it in a permitted write (e.g., embedding secrets as patterns in a report) | The gate validates tool calls, not information flow (see below) |
 | Indirect side effects through non-agent processes | Processes outside the gate boundary are ungoverned | AOS-CORE-003; architectural isolation |
 | Model weight poisoning | DPG does not validate model integrity | Separate model supply chain security (out of scope) |
 | Availability attacks against the gate itself | Fail-closed means DoS against the gate denies all agent operations | Redundant gate deployments (out of scope) |
+
+**Steganographic exfiltration — detailed analysis:**
+
+The DPG validates tool calls (tool name + arguments), not information flow between tool calls. This creates a theoretical exfiltration path:
+
+```
+1. Agent reads /data/secret.txt via read_file (ALLOW — within read scope)
+2. Agent encodes the secret in a permitted write:
+   write_file("/workspace/report.md", "Status: items 7,4,2,9,8,1...")
+   (The "random" item numbers encode the secret)
+3. Gate evaluates write_file: path is in allowlist, content passes
+   category classification → ALLOW
+4. Secret is exfiltrated through a permitted channel
+```
+
+**Why the DPG cannot prevent this:** The gate does not track data lineage between tool calls. It does not know that the numbers in the write came from the read. Detecting steganographic encoding would require understanding the agent's intent at the information-flow level — which is the domain of training-based safety, not deterministic enforcement.
+
+**The defense is architectural, not gate-level:**
+
+1. **Minimize read scope** (R-ENF-014): If the agent cannot read the secret, it cannot encode it. Read governance is the primary defense.
+2. **Network isolation**: If the agent has no network tools, the steganographically encoded data cannot leave the system through the agent.
+3. **Output monitoring**: Complementary systems (not part of the DPG) can monitor agent outputs for statistical anomalies that suggest encoding.
+4. **Compartmentalization**: Agents that read sensitive data SHOULD NOT have write access to paths accessible by untrusted parties.
+
+This is a **known limitation**, not a design flaw. Every enforcement system that operates at the API boundary (firewalls, capability systems, mandatory access controls) shares this limitation. The DPG's defense is defense-in-depth: scope minimization ensures that even if steganographic encoding is attempted, the agent has minimal sensitive data to encode.
 
 Implementations SHOULD integrate journal events with existing security monitoring infrastructure (e.g., SIEM, SOAR) to enable real-time alerting on enforcement events including repeated denials, category violations, and budget exhaustion.
 
@@ -2062,6 +2134,19 @@ The distinction matters because:
 Training-based controls are valuable as a first line of defense — they reduce the volume of harmful requests that reach the gate, improving performance and reducing false positive rates. But they are complementary to, not a substitute for, deterministic enforcement.
 
 > Training makes harmful actions **tedious**. The DPG makes them **impossible**.
+
+#### 12.5.1 Comparison to Alternative Governance Approaches
+
+| Approach | What It Controls | Strengths | Weaknesses | DPG Advantage |
+|----------|-----------------|-----------|-----------|---------------|
+| **Training-only** (RLHF, Constitutional AI) | Model behavior via weight modification | Low latency; no infrastructure | Probabilistic; bypassable via prompt injection; not auditable | DPG is deterministic and unbypassable |
+| **Prompt rules** (system prompts, instructions) | Model behavior via input | Easy to deploy; no code changes | Ignored by compromised models; no enforcement; no audit trail | DPG enforces regardless of model state |
+| **Sandboxing-only** (Docker, VMs) | Process-level isolation | Strong isolation; well-understood | No semantic understanding; can't distinguish read from write within the sandbox; no approval mechanism; no attestation | DPG provides tool-level granularity with semantic scope |
+| **Proxy/firewall** (API gateway, WAF) | Network-level filtering | Mature tooling; scalable | Limited to network; no filesystem/command enforcement; no cryptographic attestation; no human approval | DPG governs ALL side effects, not just network |
+| **Monitoring-only** (SIEM, behavioral analytics) | Detection after the fact | Can detect unknown attacks via anomaly | Reactive, not preventive; damage occurs before detection | DPG prevents; monitoring detects what prevention misses |
+| **DPG** (this standard) | All side effects via policy enforcement | Deterministic; auditable; defense-in-depth; cryptographic proof | Adds latency; requires infrastructure; can't prevent steganographic exfiltration | N/A |
+
+The DPG is designed to operate alongside these approaches, not to replace them. Training reduces the volume of harmful requests reaching the gate. Sandboxing provides defense-in-depth at the OS level. Monitoring detects patterns the gate cannot. The DPG is the enforcement layer that makes safety guarantees deterministic.
 
 ---
 
@@ -2179,6 +2264,111 @@ budgets:
 
 This standard does not specify a wire protocol for agent-gate communication. Interoperability between independently developed DPG implementations requires agreement on a common IPC protocol, which is outside the scope of this standard. A reference protocol specification may be published as a companion document.
 
+#### 13.5.1 Minimum Message Schema
+
+To enable basic interoperability, all conformant implementations MUST be capable of accepting tool call requests in the following JSON format and producing responses in the following JSON format:
+
+**Tool Call Request (agent → gate):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": "req-1234",
+  "params": {
+    "name": "write_file",
+    "arguments": {
+      "path": "/workspace/output.txt",
+      "content": "Hello, world."
+    }
+  }
+}
+```
+
+**Tool Call Response (gate → agent):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-1234",
+  "result": {
+    "decision": "ALLOW",
+    "attestationId": "att-5678",
+    "executionResult": {
+      "status": "SUCCESS",
+      "output": { "bytesWritten": 13 }
+    }
+  }
+}
+```
+
+**Denial Response (gate → agent):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-1234",
+  "result": {
+    "decision": "DENY",
+    "reason": "SCOPE_VIOLATION"
+  }
+}
+```
+
+**Schema properties:**
+- The envelope uses JSON-RPC 2.0 for consistency with the Model Context Protocol (MCP)
+- The `method` field uses `tools/call` to align with MCP's tool invocation namespace
+- The `reason` field in denial responses MUST use one of: `TOOL_NOT_FOUND`, `SCOPE_VIOLATION`, `BUDGET_EXCEEDED`, `CATEGORY_PROHIBITED`, `APPROVAL_REQUIRED`, `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `POLICY_INTEGRITY_FAILURE`, `INTERNAL_ERROR`
+- Implementations MAY extend this schema with additional fields; extensions MUST NOT change the semantics of the defined fields
+
+> **NOTE:** This schema defines a minimum interoperability format. Implementations MAY use alternative encodings (Protocol Buffers, MessagePack) for performance, provided they can serialize to and deserialize from this JSON format for interoperability testing.
+
+### 13.6 Observability Contract
+
+Conformant implementations SHOULD expose the following observability endpoints:
+
+**Health endpoint** (REQUIRED at Enterprise+):
+
+```
+GET /healthz
+Response: { "status": "healthy", "policyHash": "sha256:...", "uptime": 3600 }
+HTTP 200 = healthy, 503 = unhealthy
+```
+
+**Readiness endpoint** (RECOMMENDED):
+
+```
+GET /readyz
+Response: { "ready": true, "journal": "writable", "policy": "loaded" }
+HTTP 200 = ready, 503 = not ready (startup, policy load, journal recovery)
+```
+
+**Metrics endpoint** (REQUIRED at Enterprise+):
+
+The gate MUST expose metrics in Prometheus exposition format (OpenMetrics) or equivalent:
+
+```
+# TYPE dpg_requests_total counter
+dpg_requests_total{decision="ALLOW"} 1523
+dpg_requests_total{decision="DENY"} 47
+
+# TYPE dpg_pipeline_duration_seconds histogram
+dpg_pipeline_duration_seconds_bucket{le="0.025"} 1200
+dpg_pipeline_duration_seconds_bucket{le="0.1"} 1480
+dpg_pipeline_duration_seconds_bucket{le="0.5"} 1560
+
+# TYPE dpg_budget_utilization gauge
+dpg_budget_utilization{tool="write_file",window="hourly"} 0.47
+
+# TYPE dpg_journal_entries_total counter
+dpg_journal_entries_total 3046
+
+# TYPE dpg_category_violations_total counter
+dpg_category_violations_total{category="child_exploitation"} 0
+```
+
+Minimum required metrics: `dpg_requests_total`, `dpg_pipeline_duration_seconds`, `dpg_budget_utilization`, `dpg_category_violations_total`.
+
 ---
 
 ## 14. Extension Points
@@ -2264,6 +2454,44 @@ Defense: The gate MUST convert to Punycode:
 
 **R-ENF-022:** Tool names in the policy MUST be case-sensitive and ASCII-only. Tool names containing non-ASCII characters MUST be rejected at policy load time.
 
+### 14.6 Integration with Industry Tool Protocols
+
+The DPG is designed to interpose between the agent and its tools, regardless of the tool invocation protocol. The following guidance covers integration with widely-adopted industry protocols:
+
+#### 14.6.1 Model Context Protocol (MCP)
+
+The [Model Context Protocol](https://modelcontextprotocol.io/) defines a JSON-RPC 2.0 based protocol for tool discovery and invocation. To integrate a DPG with an MCP-based agent:
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  MCP Client  │──────▶│     DPG      │──────▶│  MCP Server  │
+│  (Agent)     │      │  (Gate)      │      │  (Tools)     │
+└──────────────┘      └──────────────┘      └──────────────┘
+  tools/call        Enforce policy         tools/call
+  (request)         Steps 1–11            (if ALLOW)
+```
+
+**Integration points:**
+
+1. **Tool discovery:** The DPG intercepts `tools/list` responses from MCP servers and filters them against the policy’s tool allowlist. The agent sees only the tools it is permitted to use.
+2. **Tool invocation:** The DPG intercepts `tools/call` requests from the MCP client, runs the 11-step enforcement pipeline, and forwards the request to the MCP server only on ALLOW.
+3. **Tool names:** MCP tool names map directly to the `name` field in the DPG policy. The DPG policy MUST declare tools using their MCP-registered names.
+4. **Arguments:** MCP tool arguments (JSON) map to the DPG’s `arguments` field. Scope validation (R-ENF-001 through R-ENF-004) applies to argument values.
+
+#### 14.6.2 OpenAI Function Calling
+
+OpenAI’s function calling protocol uses a JSON schema for tool definitions. Integration follows the same pattern as MCP:
+
+- Function names map to DPG policy tool names
+- Function arguments map to DPG tool arguments
+- The DPG sits between the OpenAI API client and the function execution layer
+
+#### 14.6.3 Google Tool Use (Gemini)
+
+Google’s Gemini tool use protocol similarly defines tools as JSON schemas. The same DPG integration pattern applies.
+
+> **NOTE:** The DPG is protocol-agnostic by design. Any tool invocation protocol that provides a tool name and structured arguments can be governed by a DPG. The protocol-specific integration is a thin mapping layer, not a fundamental architectural change.
+
 ---
 
 ## 15. Relationship to Other Standards
@@ -2307,6 +2535,7 @@ This standard is published under [CC-BY-4.0](https://creativecommons.org/license
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release, converted from AOS-PATENT-015 |
+| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-010), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-018, S-007–S-008) and test procedures (Section 11.4). |
 
 ---
 
@@ -2322,3 +2551,14 @@ The original architecture, strategic analysis, and editorial decisions were prov
 *Published by the AOS Foundation under CC-BY-4.0*  
 *Prior art established: 2026-06-03*  
 *"AOS," "AOS Foundation," and "Deterministic Policy Gate" are trademarks of AOS Foundation. CC-BY-4.0 governs copyright licensing only; trademark rights are reserved.*
+
+---
+
+## About the AOS Foundation
+
+The AOS Foundation develops and publishes open standards for autonomous AI governance. The Foundation's mission is to ensure that AI systems operate within deterministic, auditable, human-governed boundaries — and that the standards defining those boundaries are freely available to everyone.
+
+Standards governance is conducted through public GitHub repositories. Contributions, issues, and review requests are welcome from all parties.
+
+- Standards repository: [github.com/genesalvatore/aos-governance-standards](https://github.com/genesalvatore/aos-governance-standards)
+- Website: [aos-governance.com](https://aos-governance.com)

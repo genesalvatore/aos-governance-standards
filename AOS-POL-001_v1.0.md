@@ -3,7 +3,7 @@
 standard_id: AOS-POL-001
 version: "1.0"
 title: "Policy Authoring Guide for the Deterministic Policy Gate"
-status: Draft
+status: Published
 heritage_id: "none (original companion standard)"
 category: POL
 published: 2026-06-03
@@ -2114,6 +2114,139 @@ When monitoring detects a policy-relevant incident:
 | Approval failure | Approver rubber-stamped a harmful action | Review approval process; consider reducing what requires approval |
 | Budget exhaustion exploit | Attacker consumed budget to deny service to legitimate requests | Review budget allocation; consider per-source rate limiting |
 
+### 13.5 Incident Response Playbooks
+
+The following playbooks define step-by-step procedures for the five most critical incident types. Organizations SHOULD adapt these to their specific context.
+
+#### 13.5.1 Playbook: Agent Compromise (P0 Category Violation)
+
+**Trigger:** Gate logs a DENY with reason `CATEGORY_PROHIBITED`.
+
+```
+1. IMMEDIATE (within 5 minutes):
+   a. Verify the denial in the journal (not a false alert)
+   b. If confirmed: SUSPEND the agent session
+      - Gate enters fail-closed mode for this session
+      - Agent receives DENY for all subsequent requests
+   c. Notify the security team and agent owner
+
+2. INVESTIGATE (within 1 hour):
+   a. Pull the last 100 journal entries for this agent session
+   b. Identify the sequence of tool calls leading to the violation
+   c. Determine root cause:
+      - Prompt injection? → Identify the injected content source
+      - Model misalignment? → Document the failure mode
+      - Policy gap? → Identify what should have been denied earlier
+   d. Check for successful exfiltration BEFORE the blocked request
+      (the agent may have succeeded on earlier attempts)
+
+3. REMEDIATE (within 24 hours):
+   a. If prompt injection: block the injection source
+   b. If policy gap: deploy tightened policy (emergency update per 15.3)
+   c. If model issue: escalate to model provider
+   d. Document the incident in the policy audit log
+
+4. POST-INCIDENT (within 1 week):
+   a. Review: should more categories be added to prohibited list?
+   b. Review: should scope be narrowed for this agent?
+   c. Update blast radius documentation if needed
+```
+
+#### 13.5.2 Playbook: Policy Tampering
+
+**Trigger:** Gate detects policy hash mismatch.
+
+```
+1. IMMEDIATE:
+   a. Gate has already stopped or refused to start (R-POL-003)
+   b. This is a CRITICAL security event — treat as potential breach
+   c. Notify security team immediately
+   d. DO NOT restart the gate with the modified policy
+
+2. INVESTIGATE:
+   a. Compare the on-disk policy hash with the last known good hash
+      from version control (R-POL-004)
+   b. Check version control for unauthorized commits
+   c. Check file system audit logs for who modified the policy file
+   d. Check if other gate instances are affected
+
+3. REMEDIATE:
+   a. Restore the policy from version control
+   b. Verify the restored policy hash matches the expected hash
+   c. Restart the gate
+   d. Review access controls on the policy file and deployment pipeline
+```
+
+#### 13.5.3 Playbook: Key Compromise
+
+**Trigger:** Suspicion that the gate's signing key has been exposed.
+
+```
+1. IMMEDIATE:
+   a. Revoke the compromised key in the approver registry
+   b. Generate a new signing key
+   c. Stop and restart the gate with the new key
+   d. All attestations signed with the old key are now suspect
+
+2. INVESTIGATE:
+   a. Determine the time window of potential compromise
+   b. Review ALL attestations signed during that window
+   c. Cross-reference attestation claims with actual side effects
+      (did the recorded actions actually occur?)
+
+3. REMEDIATE:
+   a. If any attestations are unverifiable or suspicious:
+      roll back the corresponding side effects where possible
+   b. Rotate all related credentials (approver keys, mTLS certs)
+   c. At Sovereign tier: initiate hardware re-keying (R-ATT-012)
+```
+
+#### 13.5.4 Playbook: Journal Corruption
+
+**Trigger:** Journal chain verification fails (R-JRN-004).
+
+```
+1. IMMEDIATE:
+   a. Gate should already be in fail-closed mode
+   b. Identify the first corrupted entry in the chain
+   c. All entries AFTER the corruption point are untrustworthy
+
+2. INVESTIGATE:
+   a. Compare journal with replicated copy (R-ENT-003)
+   b. If replicated copy is intact: the corruption is local
+   c. If both copies are corrupt: the corruption is systemic
+   d. Check for unauthorized access to journal storage
+
+3. REMEDIATE:
+   a. Restore journal from last verified backup or replica
+   b. Replay operations from the corruption point if possible
+   c. If restoration is impossible: document the gap in the audit trail
+   d. This gap constitutes a compliance event for regulated environments
+```
+
+#### 13.5.5 Playbook: Approval Channel Compromise
+
+**Trigger:** Suspicion that the approval channel has been intercepted or that approver credentials have been compromised.
+
+```
+1. IMMEDIATE:
+   a. Revoke all approver tokens/credentials
+   b. Switch all approval-required tools to DENY-ALL mode
+   c. No T3/T4 operations until the channel is re-established
+
+2. INVESTIGATE:
+   a. Review approval response times in journal — 
+      unusually fast approvals (<2 seconds) suggest automation
+   b. Review approval patterns — 100% approval rate suggests
+      rubber-stamping or compromised channel
+   c. Verify approver identities out-of-band (phone call, in person)
+
+3. REMEDIATE:
+   a. Re-issue approver credentials through a verified channel
+   b. Consider upgrading to hardware token-based approval
+   c. Implement approval rate monitoring (R-APR-011)
+```
+
 ---
 
 ## 14. Policy Migration Guide
@@ -2387,6 +2520,24 @@ AOS standards are versioned independently. The following compatibility matrix de
 
 **Breaking changes:** A major version change (e.g., CORE-001 v2.0) MAY change requirement IDs, remove requirements, or restructure the enforcement pipeline. POL-001 versions targeting v2.0 will be published as POL-001 v2.0.
 
+### 17.2 Tier and Level Alignment
+
+AOS-CORE-001 defines three **implementation tiers** (Foundation, Enterprise, Sovereign) for the gate. AOS-POL-001 defines three **conformance levels** (L1, L2, L3) for policies. The following matrix shows the canonical combinations:
+
+| Gate Tier (CORE-001) | Policy Level (POL-001) | Combination | Notes |
+|---------------------|----------------------|-------------|-------|
+| Foundation | L1 — Conformant | ✅ Recommended | Development and low-risk production |
+| Foundation | L2 — Hardened | ✅ Valid | Policy exceeds gate; acceptable for pre-migration |
+| Foundation | L3 — Sovereign | ⚠️ Not recommended | L3 requires cryptographic signing the Foundation gate may not support |
+| Enterprise | L1 — Conformant | ⚠️ Under-utilized | Gate capabilities exceed policy requirements |
+| Enterprise | L2 — Hardened | ✅ Recommended | Standard production deployment |
+| Enterprise | L3 — Sovereign | ✅ Valid | High-security on Enterprise infrastructure |
+| Sovereign | L1 — Conformant | ❌ Not conformant | Sovereign gate requires L2+ policy at minimum |
+| Sovereign | L2 — Hardened | ✅ Valid | Minimum for Sovereign gate |
+| Sovereign | L3 — Sovereign | ✅ Recommended | Full alignment for critical infrastructure |
+
+**R-POL-A-034:** A Sovereign tier gate (AOS-CORE-001) MUST NOT be configured with an L1 policy. The minimum policy level for Sovereign tier is L2 (Hardened).
+
 ---
 
 # Part III: Legal and Prior Art
@@ -2451,6 +2602,7 @@ For policy authors who need to make fast decisions, this matrix provides default
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release |
+| 1.0.1 | 2026-06-04 | Added: incident response playbooks (Section 13.5), greenfield adoption guide (Section 14.0), tier-level alignment matrix (Section 17.2), permission amplification worked example (Section 11.1), cross-standard version compatibility (Section 17.1), column-level read scope in financial template (Section 10.3), glossary cross-reference to CORE-001. Status changed from Draft to Published. |
 
 ---
 
@@ -2464,3 +2616,14 @@ This document was developed through a collaborative process. The original archit
 *Published by the AOS Foundation under CC-BY-4.0*  
 *Prior art established: 2026-06-03*  
 *"AOS," "AOS Foundation," and "Deterministic Policy Gate" are trademarks of AOS Foundation. CC-BY-4.0 governs copyright licensing only; trademark rights are reserved.*
+
+---
+
+## About the AOS Foundation
+
+The AOS Foundation develops and publishes open standards for autonomous AI governance. The Foundation's mission is to ensure that AI systems operate within deterministic, auditable, human-governed boundaries — and that the standards defining those boundaries are freely available to everyone.
+
+Standards governance is conducted through public GitHub repositories. Contributions, issues, and review requests are welcome from all parties.
+
+- Standards repository: [github.com/genesalvatore/aos-governance-standards](https://github.com/genesalvatore/aos-governance-standards)
+- Website: [aos-governance.com](https://aos-governance.com)
