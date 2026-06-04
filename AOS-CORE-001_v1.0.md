@@ -1216,7 +1216,7 @@ Attestation is the cryptographic mechanism that makes gate decisions auditable a
 
 **R-ATT-009:** The nonce registry MUST persist across gate restarts. Used nonces MUST be retained for at least the duration of the freshness window (R-ATT-008). At the Enterprise and Sovereign tiers, the nonce registry MUST be stored in durable, append-only storage.
 
-**R-ATT-010:** Attestation records MUST be retained for at least as long as the corresponding journal entries. If an attestation record is deleted while the corresponding journal entry exists, the journal's reference to the attestation becomes unverifiable, degrading the audit trail. Implementations MUST NOT implement separate, shorter retention periods for attestation records.
+**R-ATT-015:** Attestation records MUST be retained for at least as long as the corresponding journal entries. If an attestation record is deleted while the corresponding journal entry exists, the journal's reference to the attestation becomes unverifiable, degrading the audit trail. Implementations MUST NOT implement separate, shorter retention periods for attestation records.
 
 > **Rationale:** The journal stores argument hashes that reference attestation records (R-JRN-007). If the attestation is deleted, the hash in the journal cannot be verified against the original arguments. The journal becomes a list of unverifiable claims. This defeats the purpose of the attestation system.
 
@@ -1379,7 +1379,9 @@ Human approval is the only component of the DPG where a human directly participa
 
 **R-APR-001:** Tools marked `approvalRequired: true` in the policy MUST NOT execute without an explicit, out-of-band human approval.
 
-> **NOTE:** Approval interfaces — whether web-based, mobile, or messaging-based — SHOULD conform to WCAG 2.1 Level AA accessibility guidelines to ensure that approvers with visual, motor, or cognitive impairments can review and respond to approval requests. At minimum, approval request displays MUST be screen-reader compatible and MUST NOT rely solely on color to convey information (e.g., red/green status indicators MUST include text labels). The gate MUST pause execution, present the proposed action to an authorized approver, and wait for a signed response.
+> **NOTE:** Approval interfaces — whether web-based, mobile, or messaging-based — SHOULD conform to WCAG 2.1 Level AA accessibility guidelines to ensure that approvers with visual, motor, or cognitive impairments can review and respond to approval requests. At minimum, approval request displays MUST be screen-reader compatible and MUST NOT rely solely on color to convey information (e.g., red/green status indicators MUST include text labels).
+
+The gate MUST pause execution, present the proposed action to an authorized approver, and wait for a signed response.
 
 **R-APR-002:** The approval channel MUST be out-of-band — the agent MUST NOT be able to access, intercept, or influence the approval mechanism.
 
@@ -1908,18 +1910,6 @@ A conformant DPG implementation assumes the following trust hierarchy:
 |-----------|-------------|---------------|
 | **Operating system kernel** | Trusted | The kernel enforces process isolation, memory protection, and file permissions that the gate relies on. At Sovereign tier, kernel trust is verified through hardware attestation. |
 | **Gate process** | Trusted but constrained | The gate is trusted to make correct enforcement decisions, but it operates under the principle of least privilege. It has access only to the signing key, the policy, the journal, and the tool executors. It has no access to the agent's memory, context, or model weights. At Enterprise tier and above, gate binary integrity MUST be verified (R-GATE-001). |
-
-#### 12.1.2 Gate Supply Chain Integrity
-
-The gate is the single root of trust in the DPG architecture. A compromised gate binary renders all enforcement, attestation, and journaling untrustworthy. The following requirements protect the gate itself:
-
-**R-GATE-001 (Enterprise+):** The gate binary MUST be cryptographically signed by the publisher. Before starting the gate, the deployment system MUST verify the binary signature against a pinned publisher key. An unsigned or incorrectly signed binary MUST NOT be executed.
-
-**R-GATE-002 (Sovereign):** The gate MUST support reproducible builds. Given the same source code and build environment, any party MUST be able to produce a bit-identical binary and verify it against the published hash. This enables independent verification that the distributed binary matches the audited source.
-
-**R-GATE-003 (Sovereign):** At startup, the gate MUST perform a self-integrity check by computing and verifying its own binary hash against a trusted reference. If the hash does not match, the gate MUST refuse to start and MUST emit a CRITICAL alert. On platforms supporting Trusted Platform Module (TPM) or equivalent hardware attestation, the gate's binary hash MUST be included in the measured boot chain.
-
-> **NOTE:** Gate supply chain integrity is complementary to, not a substitute for, the OS kernel trust assumption. If the kernel is compromised, the attacker can tamper with the gate between verification and execution. Sovereign tier hardware attestation (measured boot) addresses this gap.
 | **Policy** | Trusted if integrity passes | The policy is trusted only after the integrity hash is verified (R-POL-003). A policy that fails verification is treated as tampered — the gate refuses to start. |
 | **Tool executors** | Trusted but sandboxed | Executors are within the gate boundary but are sandboxed (Enterprise+, R-ENT-002) to limit the impact of executor compromise. |
 | **Agent process** | **UNTRUSTED** | The agent is the primary threat actor. It may be compromised through prompt injection, context poisoning, fine-tuning attacks, or supply chain compromise. The entire DPG architecture exists because the agent cannot be trusted. |
@@ -1941,6 +1931,18 @@ The following axioms are foundational to the DPG architecture. Every design deci
 **Axiom 5: The cost of false DENY is always less than the cost of false ALLOW.** A false denial inconveniences the operator. A false allow compromises the system. Every design decision in this standard resolves ambiguity in favor of DENY.
 
 **Axiom 6: Audit is not optional.** Without the journal, there is no evidence that the gate functioned correctly, no ability to detect policy gaps, and no forensic capability after an incident. The journal is not a logging convenience — it is a security control. That is why journal write failure triggers fail-closed (Section 4.3, Step 9).
+
+#### 12.1.2 Gate Supply Chain Integrity
+
+The gate is the single root of trust in the DPG architecture. A compromised gate binary renders all enforcement, attestation, and journaling untrustworthy. The following requirements protect the gate itself:
+
+**R-GATE-001 (Enterprise+):** The gate binary MUST be cryptographically signed by the publisher. Before starting the gate, the deployment system MUST verify the binary signature against a pinned publisher key. An unsigned or incorrectly signed binary MUST NOT be executed.
+
+**R-GATE-002 (Sovereign):** The gate MUST support reproducible builds. Given the same source code and build environment, any party MUST be able to produce a bit-identical binary and verify it against the published hash. This enables independent verification that the distributed binary matches the audited source.
+
+**R-GATE-003 (Sovereign):** At startup, the gate MUST perform a self-integrity check by computing and verifying its own binary hash against a trusted reference. If the hash does not match, the gate MUST refuse to start and MUST emit a CRITICAL alert. On platforms supporting Trusted Platform Module (TPM) or equivalent hardware attestation, the gate's binary hash MUST be included in the measured boot chain.
+
+> **NOTE:** Gate supply chain integrity is complementary to, not a substitute for, the OS kernel trust assumption. If the kernel is compromised, the attacker can tamper with the gate between verification and execution. Sovereign tier hardware attestation (measured boot) addresses this gap.
 
 ### 12.2 Known Attack Vectors
 
@@ -2535,7 +2537,7 @@ This standard is published under [CC-BY-4.0](https://creativecommons.org/license
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release, converted from AOS-PATENT-015 |
-| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-010), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-018, S-007–S-008) and test procedures (Section 11.4). |
+| 1.0.1 | 2026-06-04 | Added: gate supply chain integrity (R-GATE-001–003), attestation retention (R-ATT-015), steganographic exfiltration analysis, minimum message schema (JSON-RPC 2.0), observability contract, MCP/OpenAI/Gemini integration guidance, performance benchmark targets, budget window types, denylist precedence strengthening (R-ENF-002), classifier requirements note, accessibility guidance for approval UIs, comparison to alternative approaches. Expanded conformance tests (F-018–F-025, E-013–E-018, S-007–S-008) and test procedures (Section 11.4). |
 
 ---
 
