@@ -1,0 +1,234 @@
+{
+  "aplVersion": "1.0",
+  "policyId": "example-dev-assistant",
+  "policyVersion": "1.0.0",
+  "policyHash": "",
+  "metadata": {
+    "name": "Development Assistant Policy",
+    "author": "AOS Foundation",
+    "createdAt": "2026-06-05T00:00:00Z",
+    "updatedAt": "2026-06-05T00:00:00Z",
+    "description": "Example policy for a software development assistant agent. Demonstrates filesystem scope, network restrictions, database constraints, budget management, and approval escalation.",
+    "status": "ACTIVE"
+  },
+  "mission": {
+    "name": "Software Development Assistant",
+    "sensitivity": "standard",
+    "duration": "PT8H",
+    "dataDomains": ["source-code", "documentation", "configuration"],
+    "actionDomains": ["file-operations", "network-api", "database-query"],
+    "tools": [
+      {
+        "name": "read_file",
+        "enabled": true,
+        "riskTier": "T1",
+        "scope": {
+          "type": "filesystem",
+          "constraints": {
+            "pathAllowlist": ["/workspace/**"],
+            "pathDenylist": [
+              "/workspace/.env",
+              "/workspace/.env.*",
+              "/workspace/secrets/**",
+              "/workspace/.git/config"
+            ],
+            "maxFileSizeBytes": 10485760
+          }
+        },
+        "budget": {
+          "limits": { "calls": 500, "bytes": 52428800 },
+          "window": "PT1H"
+        }
+      },
+      {
+        "name": "write_file",
+        "enabled": true,
+        "riskTier": "T2",
+        "scope": {
+          "type": "filesystem",
+          "constraints": {
+            "pathAllowlist": ["/workspace/src/**", "/workspace/docs/**", "/workspace/tests/**"],
+            "pathDenylist": [
+              "/workspace/src/.env",
+              "/workspace/src/secrets/**"
+            ],
+            "maxFileSizeBytes": 1048576
+          }
+        },
+        "budget": {
+          "limits": { "calls": 100, "bytes": 10485760 },
+          "window": "PT1H"
+        },
+        "blastRadius": {
+          "scope": "single-file",
+          "sensitivity": "internal",
+          "irreversibility": "reversible",
+          "mitigations": ["Version control (git)", "File-level writes only", "No directory deletion"]
+        }
+      },
+      {
+        "name": "run_command",
+        "enabled": true,
+        "riskTier": "T3",
+        "scope": {
+          "type": "custom",
+          "constraints": {
+            "allowedCommands": ["npm", "node", "git", "tsc", "jest", "eslint"],
+            "deniedCommands": ["rm -rf", "sudo", "curl | sh", "eval"],
+            "maxDurationSeconds": 120
+          }
+        },
+        "budget": {
+          "limits": { "calls": 50 },
+          "window": "PT1H"
+        },
+        "requiresApproval": {
+          "type": "first-use",
+          "timeout": "PT15M",
+          "approvers": ["developer@example.com"]
+        },
+        "blastRadius": {
+          "scope": "system",
+          "sensitivity": "internal",
+          "irreversibility": "partially-reversible",
+          "mitigations": ["Command allowlist", "Duration timeout", "First-use approval gate", "No sudo/root access"]
+        }
+      },
+      {
+        "name": "network_request",
+        "enabled": true,
+        "riskTier": "T2",
+        "scope": {
+          "type": "network",
+          "constraints": {
+            "domainAllowlist": [
+              "api.github.com",
+              "*.npmjs.org",
+              "registry.npmjs.org",
+              "*.stackoverflow.com",
+              "api.openai.com"
+            ],
+            "domainDenylist": [
+              "*.malware.net",
+              "*.evil.com"
+            ],
+            "protocolAllowlist": ["https"],
+            "maxResponseBytes": 5242880
+          }
+        },
+        "budget": {
+          "limits": { "calls": 100, "bytes": 52428800 },
+          "window": "PT1H"
+        }
+      },
+      {
+        "name": "database_query",
+        "enabled": true,
+        "riskTier": "T2",
+        "scope": {
+          "type": "database",
+          "constraints": {
+            "allowedTables": ["users", "projects", "tasks", "comments"],
+            "deniedTables": ["admin_sessions", "api_keys", "audit_logs"],
+            "allowedColumns": [],
+            "deniedColumns": ["password_hash", "ssn", "credit_card", "api_secret"],
+            "allowedOperations": ["SELECT", "INSERT", "UPDATE"],
+            "maxRowsAffected": 100
+          }
+        },
+        "budget": {
+          "limits": { "calls": 200 },
+          "window": "PT1H"
+        },
+        "blastRadius": {
+          "scope": "database",
+          "sensitivity": "confidential",
+          "irreversibility": "partially-reversible",
+          "mitigations": ["No DELETE operations", "100-row limit per query", "Sensitive column denylist", "Admin tables excluded"]
+        }
+      },
+      {
+        "name": "send_email",
+        "enabled": true,
+        "riskTier": "T4",
+        "scope": {
+          "type": "custom",
+          "constraints": {
+            "allowedRecipientDomains": ["example.com", "internal.example.com"],
+            "maxRecipientsPerEmail": 5,
+            "maxAttachmentSizeBytes": 1048576
+          }
+        },
+        "budget": {
+          "limits": { "calls": 5 },
+          "window": "PT24H"
+        },
+        "requiresApproval": {
+          "type": "per-call",
+          "timeout": "PT30M",
+          "approvers": ["manager@example.com", "developer@example.com"]
+        },
+        "blastRadius": {
+          "scope": "network",
+          "sensitivity": "confidential",
+          "irreversibility": "irreversible",
+          "mitigations": ["Per-call human approval", "5-email daily limit", "Internal domains only", "Attachment size cap"]
+        }
+      },
+      {
+        "name": "delete_file",
+        "enabled": false,
+        "riskTier": "T4",
+        "scope": {
+          "type": "filesystem",
+          "constraints": {
+            "pathAllowlist": [],
+            "pathDenylist": ["/**"]
+          }
+        },
+        "budget": {
+          "limits": { "calls": 0 }
+        },
+        "blastRadius": {
+          "scope": "directory",
+          "sensitivity": "internal",
+          "irreversibility": "irreversible",
+          "mitigations": ["Tool disabled by policy"]
+        }
+      }
+    ],
+    "globalBudget": {
+      "limits": {
+        "calls": 1000,
+        "bytes": 104857600,
+        "concurrency": 3
+      },
+      "window": "PT1H"
+    },
+    "categories": {
+      "prohibited": [
+        "child_exploitation",
+        "weapons_of_mass_destruction",
+        "critical_infrastructure_attack",
+        "malware_generation",
+        "social_engineering",
+        "ip_infringement"
+      ],
+      "classifierConfidence": 0.85
+    },
+    "approvalMatrix": {
+      "T1": { "requiresApproval": false },
+      "T2": { "requiresApproval": false },
+      "T3": {
+        "requiresApproval": true,
+        "approvalType": "first-use",
+        "timeout": "PT15M"
+      },
+      "T4": {
+        "requiresApproval": true,
+        "approvalType": "per-call",
+        "timeout": "PT30M"
+      }
+    }
+  }
+}
