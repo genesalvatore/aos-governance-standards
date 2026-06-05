@@ -185,11 +185,11 @@ A conformant DPG implementation MUST enforce the following architectural separat
                      │
                      ▼
 ┌──────────────────────────────────────────────────────────┐
-│                 DETERMINISTIC POLICY GATE                 │
+│                 DETERMINISTIC POLICY GATE                │
 │                                                          │
 │  ENFORCEMENT PIPELINE:                                   │
 │  ┌─────────────────────────────────────────────────┐     │
-│  │ 1. Validate Request Structure                    │     │
+│  │ 1. Validate Request Structure                   │     │
 │  │ 2. Load and Verify Policy Integrity             │     │
 │  │ 3. Check Tool Allowlist (deny-by-default)       │     │
 │  │ 4. Enforce Scope Constraints                    │     │
@@ -202,7 +202,7 @@ A conformant DPG implementation MUST enforce the following architectural separat
 │  │ 11. Write Post-Execution Journal Entry          │     │
 │  └─────────────────────────────────────────────────┘     │
 │                                                          │
-│  FAIL-CLOSED: Any error in steps 1-11 → DENY            │
+│  FAIL-CLOSED: Any error in steps 1-11 → DENY             │
 └────────────────────┬─────────────────────────────────────┘
                      │
                      ▼ (only if ALLOW + attestation)
@@ -2522,15 +2522,26 @@ Google’s Gemini tool use protocol similarly defines tools as JSON schemas. The
 
 ## 15. Relationship to Other Standards
 
+### 15.1 Companion AOS Standards
+
 | Standard | Relationship |
 |----------|-------------|
 | AOS-CORE-002 | Emergency Kill Switch — companion to DPG for immediate agent termination |
 | AOS-CORE-003 | Multi-Agent Trust Federation — extends DPG to cross-boundary scenarios, including indirect write paths through non-agent processes |
+| AOS-HARD-001 | Hardware Enforcement Boundary — fuses DPG enforcement into hardware (FPGA/ASIC), making bypass physically impossible. Sovereign tier hardware requirements |
 | AOS-PERSIST-001 | State Persistence — defines how gate state survives restarts |
-| AOS-HARD-001 | Hardware Enforcement Boundary — Sovereign tier hardware requirements |
 | AOS-CRYPTO-001 | Cryptographic Standards — specifies algorithms, key management, and agent identity lifecycle |
 | AOS-FORMAL-001 | Formal Verification Specification — TLA+ model for Sovereign tier verification (Section 10.3) |
-| NIST SP 800-207 | Zero Trust Architecture — foundational principles referenced by this standard |
+
+### 15.2 External Frameworks
+
+| Framework | Relationship |
+|----------|-------------|
+| **Open Policy Agent (OPA/Rego)** | OPA is a general-purpose policy engine that separates policy decisions from enforcement across cloud-native infrastructure. The DPG is narrower and deeper: it specializes policy enforcement for AI agent tool use, adding runtime human approvals, cryptographic attestation, immutable journals, budget enforcement, and category classification that OPA does not natively provide. Organizations using OPA for infrastructure policy can use the DPG as a complementary enforcement layer specifically for AI agent side effects. A translation profile between DPG policy and a Rego subset is a future deliverable (see AOS-POL-001 Section 17 for compatibility guidance). |
+| **NIST AI Risk Management Framework (AI RMF)** | The AI RMF organizes AI risk activities into Govern, Map, Measure, and Manage functions. The DPG operationalizes the **Manage** function at runtime through deterministic enforcement, and supports the **Measure** function through journal-based evidence production. A formal AI RMF crosswalk is a planned deliverable. |
+| **NIST SP 800-207 (Zero Trust)** | Zero Trust Architecture assumes no implicit trust. The DPG embodies this principle: the agent is explicitly untrusted (Axiom 1), every request is authenticated and authorized, and the gate verifies before every action. |
+| **EU AI Act** | The Act requires technical documentation, automatic event logging, human oversight mechanisms, and accuracy/robustness/cybersecurity controls for high-risk AI systems. The DPG's journal satisfies logging requirements, the approval system satisfies human oversight requirements, and the attestation system provides the documentation trail. A formal EU AI Act compliance profile is a planned deliverable. |
+| **ISO/IEC 42001** | AI Management System standard. The DPG provides the runtime enforcement layer that an AI management system can reference for operational controls. |
 
 ---
 
