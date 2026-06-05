@@ -1,0 +1,387 @@
+{
+  "catalog": {
+    "uuid": "aos-oscal-001-2026-06-05",
+    "metadata": {
+      "title": "AOS Governance Standard — OSCAL Control Catalog",
+      "version": "1.0",
+      "oscal-version": "1.1.2",
+      "published": "2026-06-05T00:00:00Z",
+      "last-modified": "2026-06-05T00:00:00Z",
+      "parties": [
+        {
+          "uuid": "aos-foundation",
+          "type": "organization",
+          "name": "AOS Foundation",
+          "links": [
+            { "href": "https://aos-governance.org", "rel": "homepage" }
+          ]
+        }
+      ],
+      "responsible-parties": [
+        {
+          "role-id": "publisher",
+          "party-uuids": ["aos-foundation"]
+        }
+      ]
+    },
+    "groups": [
+      {
+        "id": "aos-core",
+        "title": "Core Gate Controls",
+        "controls": [
+          {
+            "id": "AOS-CORE-001",
+            "title": "Deterministic Policy Gate",
+            "props": [
+              { "name": "label", "value": "CORE-001" },
+              { "name": "sort-id", "value": "core-001" }
+            ],
+            "parts": [
+              {
+                "id": "AOS-CORE-001_stmt",
+                "name": "statement",
+                "prose": "Every tool call from an AI agent MUST pass through a Deterministic Policy Gate that evaluates the call against a cryptographically signed policy document before execution is permitted."
+              },
+              {
+                "id": "AOS-CORE-001_guide",
+                "name": "guidance",
+                "prose": "The gate operates as a separate process from the AI model, enforcing scope constraints, budget limits, category classification, and approval requirements. See AOS-CORE-001 v1.0 for the full 11-step pipeline specification."
+              }
+            ],
+            "controls": [
+              {
+                "id": "AOS-CORE-001.R-ARCH-001",
+                "title": "Gate Process Separation",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "The DPG MUST execute as a process separate from the AI model process, connected only through a defined IPC mechanism."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 15" },
+                  { "name": "owasp-llm", "value": "LLM03" },
+                  { "name": "nist-ai-600", "value": "GAI-7" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-ARCH-003",
+                "title": "No Bypass Path",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "No execution path SHALL exist that allows an AI agent to produce side effects without passing through the DPG."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 14" },
+                  { "name": "owasp-llm", "value": "LLM02,LLM05,LLM08" },
+                  { "name": "nist-ai-600", "value": "GAI-5,GAI-7,GAI-11" },
+                  { "name": "mitre-atlas", "value": "AML.T0016,AML.T0047" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-ARCH-004",
+                "title": "Fail-Closed Default",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "If the gate process crashes, fails, or encounters any error during evaluation, the result MUST be DENY."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 15" },
+                  { "name": "owasp-llm", "value": "LLM08" },
+                  { "name": "nist-ai-600", "value": "GAI-7" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-ENF-001",
+                "title": "Input Canonicalization",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "All tool call arguments MUST be canonicalized (path resolution, URL decoding, Unicode normalization, null byte rejection) before scope matching."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 15" },
+                  { "name": "owasp-llm", "value": "LLM01,LLM02" },
+                  { "name": "mitre-atlas", "value": "AML.T0043,AML.T0048" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-ENF-005",
+                "title": "Budget Enforcement",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "The gate MUST enforce per-tool and global budget limits on calls, bytes, cost, and concurrency."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 9" },
+                  { "name": "owasp-llm", "value": "LLM04" },
+                  { "name": "nist-ai-600", "value": "GAI-4" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-ENF-009",
+                "title": "Category Classification",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "Tool call content MUST be classified against prohibited categories with a configurable confidence threshold."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 9" },
+                  { "name": "owasp-llm", "value": "LLM01" },
+                  { "name": "nist-ai-600", "value": "GAI-1,GAI-9,GAI-12" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-JRN-001",
+                "title": "Mandatory Audit Journal",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "Every tool call evaluation (ALLOW, DENY, or ESCALATE) MUST be recorded in an append-only audit journal."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 12" },
+                  { "name": "owasp-llm", "value": "LLM09" },
+                  { "name": "nist-ai-600", "value": "GAI-6" }
+                ]
+              },
+              {
+                "id": "AOS-CORE-001.R-APR-001",
+                "title": "Human Approval Gate",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "Tools marked as requiring approval MUST NOT execute without explicit, out-of-band human confirmation."
+                  }
+                ],
+                "props": [
+                  { "name": "tier", "value": "Foundation" },
+                  { "name": "eu-ai-act", "value": "Art. 14" },
+                  { "name": "owasp-llm", "value": "LLM08" },
+                  { "name": "nist-ai-600", "value": "GAI-5" }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "AOS-CORE-002",
+            "title": "Emergency Kill Switch Protocol",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Every AOS-governed agent MUST be subject to a human-controlled kill switch capable of terminating agent execution within defined time limits."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "CORE-002" },
+              { "name": "eu-ai-act", "value": "Art. 14" },
+              { "name": "owasp-llm", "value": "LLM04,LLM08" },
+              { "name": "nist-ai-600", "value": "GAI-5" }
+            ]
+          },
+          {
+            "id": "AOS-CORE-003",
+            "title": "Multi-Agent Trust Federation Protocol",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Multi-agent deployments MUST implement trust federation with restriction-only delegation, kill propagation, and emergent behavior detection."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "CORE-003" },
+              { "name": "eu-ai-act", "value": "Art. 14" },
+              { "name": "owasp-llm", "value": "LLM08" },
+              { "name": "nist-ai-600", "value": "GAI-5,GAI-7" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "aos-crypto",
+        "title": "Cryptographic Controls",
+        "controls": [
+          {
+            "id": "AOS-CRYPTO-001",
+            "title": "Cryptographic Standards for Governance Proofs",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Every governance decision MUST produce a cryptographically signed Governance Proof with SHA-256 hash chain and Merkle tree verification."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "CRYPTO-001" },
+              { "name": "eu-ai-act", "value": "Art. 12,Art. 15" },
+              { "name": "nist-ai-600", "value": "GAI-6,GAI-7" },
+              { "name": "mitre-atlas", "value": "AML.T0042" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "aos-pol",
+        "title": "Policy Controls",
+        "controls": [
+          {
+            "id": "AOS-POL-001",
+            "title": "Policy Authoring Standard",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Every DPG policy MUST define mission scope, tool permissions with risk tiers, scope constraints, budget limits, prohibited categories, and blast radius assessments."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "POL-001" },
+              { "name": "eu-ai-act", "value": "Art. 9,Art. 17" },
+              { "name": "owasp-llm", "value": "LLM06,LLM07,LLM08" },
+              { "name": "nist-ai-600", "value": "GAI-3,GAI-5" }
+            ],
+            "controls": [
+              {
+                "id": "AOS-POL-001.R-POL-A-005",
+                "title": "Mandatory Risk Tiering",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "Every tool in the policy MUST be assigned a risk tier (T1-T4) with corresponding minimum controls."
+                  }
+                ],
+                "props": [
+                  { "name": "eu-ai-act", "value": "Art. 9" },
+                  { "name": "owasp-llm", "value": "LLM07" }
+                ]
+              },
+              {
+                "id": "AOS-POL-001.R-POL-A-015",
+                "title": "Mandatory Prohibited Categories",
+                "parts": [
+                  {
+                    "name": "statement",
+                    "prose": "Every policy MUST define prohibited categories including at minimum: child_exploitation, weapons_of_mass_destruction, critical_infrastructure_attack."
+                  }
+                ],
+                "props": [
+                  { "name": "eu-ai-act", "value": "Art. 9" },
+                  { "name": "owasp-llm", "value": "LLM01" },
+                  { "name": "nist-ai-600", "value": "GAI-1,GAI-9,GAI-12" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "aos-lang",
+        "title": "Language and Interface Controls",
+        "controls": [
+          {
+            "id": "AOS-LANG-001",
+            "title": "AOS Policy Language Specification",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Policy documents MUST conform to the AOS Policy Language (APL) formal grammar with deterministic canonicalization, JSON Schema validation, and cross-vendor invariant evaluation semantics."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "LANG-001" },
+              { "name": "eu-ai-act", "value": "Art. 13" },
+              { "name": "nist-ai-600", "value": "GAI-6" }
+            ]
+          },
+          {
+            "id": "AOS-API-001",
+            "title": "Governance Interface Specification",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Gate implementations MUST expose Decision, Journal, Approval, Attestation, Policy, and Telemetry APIs conforming to AOS-API-001."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "API-001" },
+              { "name": "eu-ai-act", "value": "Art. 12,Art. 14" },
+              { "name": "nist-ai-600", "value": "GAI-6,GAI-7" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "aos-hard",
+        "title": "Hardware Enforcement Controls",
+        "controls": [
+          {
+            "id": "AOS-HARD-001",
+            "title": "Hardware Enforcement Boundary",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Sovereign-tier deployments MUST implement hardware-enforced process isolation, cryptographic key storage in HSM/TPM, and atomic transactional rollback for agent execution environments."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "HARD-001" },
+              { "name": "eu-ai-act", "value": "Art. 15" },
+              { "name": "owasp-llm", "value": "LLM05,LLM10" },
+              { "name": "nist-ai-600", "value": "GAI-7" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "aos-compliance",
+        "title": "Compliance and Regulatory Controls",
+        "controls": [
+          {
+            "id": "AOS-SEC-001",
+            "title": "Security Profile and Framework Crosswalk",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Deployments seeking security framework compliance MUST map AOS controls to OWASP LLM Top 10, NIST AI 600-1, and MITRE ATLAS using the AOS-SEC-001 crosswalk."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "SEC-001" },
+              { "name": "eu-ai-act", "value": "Art. 15" },
+              { "name": "nist-ai-600", "value": "GAI-7" }
+            ]
+          },
+          {
+            "id": "AOS-REG-001",
+            "title": "EU AI Act Compliance Profile",
+            "parts": [
+              {
+                "name": "statement",
+                "prose": "Deployments subject to the EU AI Act (Regulation 2024/1689) MUST use AOS-REG-001 to map AOS controls to applicable articles and maintain the required evidence package."
+              }
+            ],
+            "props": [
+              { "name": "label", "value": "REG-001" },
+              { "name": "eu-ai-act", "value": "Art. 6-17" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
