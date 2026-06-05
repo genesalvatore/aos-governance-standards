@@ -2605,12 +2605,157 @@ For policy authors who need to make fast decisions, this matrix provides default
 |---------|------|---------|
 | 1.0 | 2026-06-03 | Initial standard release |
 | 1.0.1 | 2026-06-04 | Added: incident response playbooks (Section 13.5), greenfield adoption guide (Section 14.0), tier-level alignment matrix (Section 17.2), permission amplification worked example (Section 11.1), cross-standard version compatibility (Section 17.1), column-level read scope in financial template (Section 10.3), glossary cross-reference to CORE-001, deployment suitability cross-reference (Section 4.2, referencing AOS-CORE-001 Section 1.4). Status changed from Draft to Published. |
+| 1.0.2 | 2026-06-05 | Added: Appendix F (Tier Selection Guide) with decision tree, worked examples, cost analysis, and selection criteria. |
 
 ---
 
 ## Appendix E: AI Disclosure
 
 This document was developed through a collaborative process. The original architecture, strategic analysis, and editorial decisions were provided by the author. AI tools assisted with technical review, adversarial analysis, drafting, and structural refinement under human editorial control.
+
+---
+
+## Appendix F: Tier Selection Guide
+
+This appendix provides a structured decision framework for selecting the appropriate AOS implementation tier (Foundation, Enterprise, Sovereign) and policy conformance level (L1, L2, L3). This is INFORMATIVE guidance — organizations should adapt based on their specific risk profile.
+
+### F.1 Decision Flowchart
+
+```mermaid
+flowchart TD
+    A["Start: What does your agent do?"] --> B{"Does it handle regulated data?<br/>(PII, PHI, PCI, classified)"}
+    B -->|Yes| C{"Is it in a critical infrastructure,<br/>national security, or financial<br/>settlement context?"}
+    B -->|No| D{"Does it perform irreversible<br/>actions in production?"}
+    C -->|Yes| SOV["🔴 SOVEREIGN TIER<br/>Gate: Sovereign | Policy: L3"]
+    C -->|No| ENT["🟡 ENTERPRISE TIER<br/>Gate: Enterprise | Policy: L2"]
+    D -->|Yes| E{"Are there >10 agents<br/>sharing resources?"}
+    D -->|No| F{"Is this a production<br/>deployment?"}
+    E -->|Yes| ENT
+    E -->|No| G{"Is independent review<br/>required by org policy?"}
+    G -->|Yes| ENT
+    G -->|No| FND["🟢 FOUNDATION TIER<br/>Gate: Foundation | Policy: L1"]
+    F -->|Yes| H{"Does the agent have<br/>write access?"}
+    F -->|No| FND
+    H -->|Yes| G
+    H -->|No| FND
+```
+
+### F.2 Selection Criteria Matrix
+
+| Criterion | Foundation (L1) | Enterprise (L2) | Sovereign (L3) |
+|-----------|----------------|-----------------|----------------|
+| **Data sensitivity** | Internal, non-sensitive | Confidential, PII, PHI | Classified, national security, financial settlement |
+| **Reversibility** | All actions reversible | Mix of reversible and partially-reversible | Irreversible actions with real-world consequences |
+| **Agent count** | 1–10 agents | 10–100 agents | 100+ agents or multi-organization federation |
+| **Regulatory** | No external regulatory requirements | HIPAA, PCI DSS, GDPR, SOC 2 | SOX, FedRAMP, DoD IL4+, EU AI Act (high-risk) |
+| **Review process** | Self-review acceptable | Independent reviewer required | Qualified security reviewer with domain expertise |
+| **Testing** | Manual testing acceptable | Automated CI/CD testing required | Automated testing + independent validation |
+| **Policy signing** | Hash verification only | Hash verification | Cryptographic signature (Ed25519) |
+| **Journal** | Append-only log | Append-only log + replication | Merkle-tree hash chain + replicated + signed |
+| **Monitoring** | Recommended | Required | Required + incident response SLAs |
+| **Blast radius** | Documentation optional | Documentation mandatory (T3+) | Documentation + independent validation |
+| **Cost estimate** | Low — single gate, minimal ops | Medium — dedicated reviewer, CI/CD, monitoring | High — HSM, dedicated security team, formal audits |
+
+### F.3 Worked Examples
+
+#### Example 1: Startup Code Assistant (→ Foundation)
+
+A 5-person startup uses an AI code assistant that reads/writes project files and runs `npm test`.
+
+| Factor | Assessment |
+|--------|------------|
+| Data | Source code (internal, non-sensitive) |
+| Actions | File writes (reversible via git), test execution (side-effect-free) |
+| Regulation | None |
+| Agent count | 1 |
+| **Verdict** | **Foundation / L1** — Self-review, hash verification, manual testing. The agent cannot cause irreversible harm and handles no regulated data. |
+
+**Estimated setup time:** 2–4 hours (policy authoring + validation + initial monitoring mode)
+
+#### Example 2: Healthcare Documentation Agent (→ Enterprise)
+
+A hospital deploys an agent that reads patient records and generates clinical summaries.
+
+| Factor | Assessment |
+|--------|------------|
+| Data | PHI (HIPAA-regulated) |
+| Actions | Read-only database queries, document generation |
+| Regulation | HIPAA Security Rule |
+| Agent count | 3 (one per department) |
+| **Verdict** | **Enterprise / L2** — HIPAA requires access control review (independent reviewer). PHI column denylist mandatory. Audit journal replication required for HIPAA §164.312(b). |
+
+**Key policy additions:**
+- `deniedColumns: ["ssn", "full_name", "date_of_birth", "address"]`
+- `prohibitedCategories: ["phi_external_transmission", "de_identification_bypass"]`
+- Independent reviewer for all policy changes
+- 90-day journal retention minimum
+
+#### Example 3: Financial Trading Execution (→ Sovereign)
+
+An investment firm deploys agents that execute trades based on algorithmic strategies.
+
+| Factor | Assessment |
+|--------|------------|
+| Data | Financial positions, order flow (SOX-regulated) |
+| Actions | Trade execution (irreversible), position modification |
+| Regulation | SOX §302/§404, SEC Rule 15c3-5 (market access controls) |
+| Agent count | 12 (multi-strategy) |
+| **Verdict** | **Sovereign / L3** — Irreversible financial actions + SOX compliance require cryptographic policy signing, Merkle-tree journals, two-person approval for trade execution, and hardware-backed attestation. |
+
+**Key policy additions:**
+- All trade tools are T4 with per-call approval
+- Budget limits in both call count AND dollar value (`maxDollarValue: 100000`)
+- Blast radius documentation validated by compliance team
+- Daily journal integrity verification
+- HSM-backed signing keys (AOS-CRYPTO-001)
+
+#### Example 4: DevOps Pipeline Agent (→ Enterprise)
+
+A platform engineering team deploys an agent that manages Kubernetes deployments.
+
+| Factor | Assessment |
+|--------|------------|
+| Data | Infrastructure configuration (internal, confidential) |
+| Actions | Container deployment (partially reversible), secret rotation (irreversible) |
+| Regulation | SOC 2 Type II (customer requirement) |
+| Agent count | 5 (one per cluster) |
+| **Verdict** | **Enterprise / L2** — Mix of reversible and irreversible actions, SOC 2 compliance requirement, multi-agent coordination needed. Secret rotation tools are T4 with per-call approval. |
+
+#### Example 5: Internal Research Assistant (→ Foundation)
+
+A consulting firm uses an agent that searches internal documents and generates summaries.
+
+| Factor | Assessment |
+|--------|------------|
+| Data | Client engagement documents (confidential but not regulated) |
+| Actions | Read-only search, text generation |
+| Regulation | None (client NDAs are contractual, not regulatory) |
+| Agent count | 1 |
+| **Verdict** | **Foundation / L1** — Read-only, no regulated data, single agent. Add `domainDenylist` to prevent accidental data exfiltration via network tools. |
+
+### F.4 Common Selection Mistakes
+
+| Mistake | Why It's Wrong | Correct Approach |
+|---------|---------------|------------------|
+| Starting at Sovereign because "security matters" | Sovereign requires HSM, dedicated security team, and formal audit cadence. Premature adoption creates compliance theater. | Start at Foundation. Get enforcement running. Upgrade when you need the additional controls. |
+| Staying at Foundation for regulated data | Foundation permits self-review, which may not satisfy regulatory requirements for independent access control review. | If any external framework mandates independent review, Enterprise is the minimum tier. |
+| Choosing tier based on company size | A Fortune 500 company running a non-sensitive internal chatbot needs Foundation, not Sovereign. | Choose based on **data sensitivity + action irreversibility**, not org size. |
+| One tier for all agents | Different agents handle different data at different risk levels. | Assign tiers per-agent based on the decision flowchart. A code assistant (Foundation) and a financial executor (Sovereign) can coexist in the same organization. |
+| Skipping Foundation "because we'll go Enterprise anyway" | Foundation forces you to inventory tools, write policies, and operate a gate. This operational experience is prerequisite for Enterprise success. | Phase 1: Foundation on highest-risk agent. Phase 2: Enterprise once operational patterns are established. |
+
+### F.5 Tier Cost Estimation
+
+> **NOTE:** These are order-of-magnitude estimates for the governance-specific overhead (not the agent compute cost). Actual costs depend on organizational context.
+
+| Cost Component | Foundation | Enterprise | Sovereign |
+|---------------|-----------|------------|----------|
+| Gate infrastructure | 1 process (any server) | 2+ processes (HA) | 3+ processes (HA + HSM) |
+| Policy review time | ~1 hr/quarter (self) | ~4 hrs/quarter (independent) | ~20 hrs/quarter (security review) |
+| Monitoring | Optional dashboards | Required dashboards + alerts | Required dashboards + alerts + SLAs |
+| Testing | Manual (~30 min) | CI/CD pipeline (~4 hrs setup) | CI/CD + independent validation |
+| Personnel | Any developer | Designated reviewer | Dedicated security engineer |
+| Hardware | None additional | None additional | HSM ($5K–$50K one-time) |
+| **Annual estimate** | **$2K–$10K** | **$20K–$100K** | **$100K–$500K** |
 
 ---
 
