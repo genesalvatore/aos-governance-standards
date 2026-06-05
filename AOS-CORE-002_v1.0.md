@@ -83,7 +83,11 @@ The kill switch implements an unamendable constitutional principle: **human oper
 - Survives kernel compromise (Sovereign tier)
 - Survives network partition (all tiers — local kill always works)
 
-### 1.5 Conventions
+### 1.5 Implementation Status
+
+> **NOTE:** Foundation-tier (software-only) kill switch implementations are achievable with current technology. Enterprise-tier requires a dedicated control-plane microservice. Sovereign-tier (including Tier 4 physical-layer severance) depends on AOS-HARD-001 hardware, which does not yet exist as a commercial product. See AOS-HARD-001 Section 1.5 for the hardware development roadmap.
+
+### 1.6 Conventions
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
@@ -193,17 +197,22 @@ The kill signal is delivered through a control plane that is **architecturally s
 
 ### 4.3 Latency Requirements
 
-| Operation | Maximum Latency | Rationale |
-|-----------|----------------|-----------|
-| **Interrupt signal delivery** (operator → signal store) | ≤ 50 ms (local), ≤ 200 ms (remote) | Signal must arrive before the agent can execute a pending tool call |
-| **Interrupt check** (DPG Step 0 read) | ≤ 1 ms | Lock-free in-memory read; must not bottleneck the DPG pipeline |
-| **Execution severance** (signal → complete termination) | ≤ 100 ms (software), ≤ 10 ms (hardware) | Sub-100ms is the constitutional guarantee; hardware kill is faster |
-| **State checkpoint** (Tier 1-3 only) | ≤ 500 ms | Serialize agent state before process termination |
-| **Audit record commit** | ≤ 200 ms | Write to Merkle tree before confirming severance |
+This standard distinguishes between **severance latency** (the agent loses all execution authority) and **completion latency** (all cleanup operations finish). The constitutional guarantee applies to severance latency only.
 
-**R-INT-005:** The total latency from operator trigger to complete execution severance MUST NOT exceed 100 milliseconds for local triggers. For remote triggers (over network), the total latency MUST NOT exceed 500 milliseconds. These targets include signal delivery, interrupt check, state checkpoint (if applicable), and process termination.
+| Operation | Category | Maximum Latency | Rationale |
+|-----------|----------|----------------|-----------|
+| **Interrupt signal delivery** (operator → signal store) | Severance | ≤ 50 ms (local), ≤ 200 ms (remote) | Signal must arrive before the agent can execute a pending tool call |
+| **Interrupt check** (DPG Step 0 read) | Severance | ≤ 1 ms | Lock-free in-memory read; must not bottleneck the DPG pipeline |
+| **Token revocation** (Step 1) | Severance | < 1 ms | Agent is effectively dead after this step |
+| **Process freeze** (SIGSTOP) | Severance | < 1 ms | Prevents in-memory state modification before checkpoint |
+| **Process termination** (SIGKILL) | Severance | ≤ 50 ms | Final process destruction |
+| **State checkpoint** (Tier 1-3 only) | Completion | ≤ 500 ms | Occurs on frozen process; proceeds in parallel with kill if budget exceeded |
+| **CoW rollback** | Completion | ≤ 100 ms | Filesystem cleanup |
+| **Audit record commit** | Completion | ≤ 200 ms | Merkle tree write |
 
-**R-INT-006:** If the state checkpoint cannot complete within the latency budget, the system MUST proceed with termination WITHOUT the checkpoint. Safety takes absolute precedence over state preservation. A partial checkpoint (whatever was serialized before the deadline) SHOULD be retained for forensic value.
+**R-INT-005:** The **severance latency** from operator trigger to complete revocation of the agent's execution authority (token revocation + process termination) MUST NOT exceed 100 milliseconds for local triggers and 500 milliseconds for remote triggers. These targets cover signal delivery, interrupt check, token revocation, and process kill. State checkpointing, CoW rollback, and audit record commit are **completion operations** that occur AFTER the agent is dead and are NOT included in the severance latency guarantee.
+
+**R-INT-006:** If the state checkpoint cannot complete within its 500ms budget, the system MUST proceed with process termination WITHOUT the checkpoint. Safety takes absolute precedence over state preservation. A partial checkpoint (whatever was serialized before the deadline) SHOULD be retained for forensic value.
 
 ---
 
@@ -231,7 +240,7 @@ Interrupt Signal Structure:
   "operator_id": "<authenticated operator identity>",
   "operator_signature": "<Ed25519 signature over signal body>",
   "constitutional_basis": "<reference to constitutional authority>",
-  "urgency": "<IMMEDIATE | GRACEFUL>",
+  "urgency": "<IMMEDIATE | GRACEFUL>",   // See Section 6.6
   "payload_blocked": {
     "tool": "<tool name that was pending, if any>",
     "arguments_hash": "<SHA-256 of the blocked arguments>"
@@ -281,7 +290,7 @@ Interrupt Signal Structure:
 |------|---------------|
 | **Foundation** | HMAC-SHA256 with pre-shared key. Single operator authorization sufficient. |
 | **Enterprise** | Ed25519 signature with operator's registered public key. Single operator authorization sufficient. |
-| **Sovereign** | Ed25519 signature. For Tier 3 (Global) and Tier 4 (Physical) kills, multi-party authorization is REQUIRED: at least two independent operators must sign. For Tier 1 (Node) kills, single operator is sufficient. |
+| **Sovereign** | Ed25519 signature. For Tier 2 (Cluster, > 5 agents), Tier 3 (Global), and Tier 4 (Physical) kills, multi-party authorization is REQUIRED: at least two independent operators must sign. For Tier 1 (Node) and Tier 2 (≤ 5 agents), single operator is sufficient. |
 
 **R-INT-013:** Hardware kill triggers (physical button, watchdog timer) are EXEMPT from cryptographic authentication — they are authenticated by physical access. The audit record MUST note the trigger type as `HARDWARE_PHYSICAL` or `HARDWARE_WATCHDOG`.
 
@@ -290,6 +299,12 @@ Interrupt Signal Structure:
 **R-INT-014:** Once a kill signal is delivered to the signal store, it MUST persist until explicitly cleared by an authorized operator through the recovery protocol (Section 9). The signal MUST NOT expire automatically. The signal MUST NOT be clearable by the agent, by the agent's host OS, or by a power cycle.
 
 **R-INT-015:** For Sovereign-tier deployments, the signal store MUST be backed by non-volatile storage within the hardware enforcement boundary (AOS-HARD-001). For Enterprise tier, the signal store MUST be backed by persistent storage on a separate service. For Foundation tier, in-memory storage with write-ahead logging is acceptable.
+
+**R-INT-016:** The signal store MUST maintain a set of consumed signal_ids. The store MUST reject any signal with a signal_id that has been previously processed. The consumed set MUST be persistent (survive power cycles). For Sovereign tier, the consumed set MUST be stored within the hardware enforcement boundary. This prevents replay attacks where a captured valid kill signal is resubmitted after the agent has been reconstructed.
+
+**R-INT-017:** The DPG MUST re-check the interrupt signal store immediately before granting execution permission — after the final ALLOW decision in the 11-step pipeline and, for ESCALATE flows, after approval is received. If a kill signal arrived between Step 0 and the final decision, the tool call MUST be blocked with `EXECUTION_SEVERED`. This prevents the race condition where a kill signal arrives during a long ESCALATE wait but the already-in-progress tool call proceeds to execution.
+
+**R-INT-018:** Signal delivery interfaces MUST implement rate limiting (RECOMMENDED: ≤ 10 kill signals per minute per operator identity). Signals exceeding the rate limit MUST be logged and SHOULD trigger an alert to the security team. Rate limiting prevents a compromised operator credential from being used for persistent denial-of-service via kill signal flooding.
 
 ---
 
@@ -312,7 +327,7 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 
   Auth:                Auth:               Auth:               Auth:
   1 operator           1 operator          2 operators         2 operators
-                                           (multi-party)       + physical access
+                       (2 if > 5 agents)   (multi-party)       + physical access
 
   State saved:         State saved:        State saved:        State NOT saved
   YES                  YES                 YES (best-effort)   (emergency only)
@@ -320,18 +335,25 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 
 ### 6.2 Tier 1: Node-Level Severance
 
-**R-SEV-002:** Node-level severance terminates execution authority for a single agent. The procedure MUST execute in the following order:
+**R-SEV-002:** Node-level severance terminates execution authority for a single agent. The procedure MUST execute in two phases:
+
+**Phase 1 — Severance (≤ 100ms total, constitutional guarantee):**
 
 1. **Revoke execution tokens** at the DPG (< 1 ms). After this step, all tool calls from this agent return `EXECUTION_SEVERED`. The agent is effectively dead even if the process hasn't been killed yet.
-2. **Serialize cognitive state** (≤ 500 ms). Capture the agent's current context, the pending tool call (if any), open connections, and process state.
-3. **Commit state checkpoint to Merkle tree** (≤ 200 ms). The checkpoint is signed and chained to the audit trail.
-4. **Terminate the agent process** (≤ 50 ms). SIGKILL — no cleanup handlers, no graceful shutdown.
-5. **Execute CoW rollback** (≤ 100 ms) if the agent was operating in a CoW environment (AOS-HARD-001 Section 6).
-6. **Write audit record** (≤ 200 ms). Final journal entry with kill event, trigger, checkpoint hash, and operator signature.
+2. **Freeze the agent process** (< 1 ms). Send SIGSTOP to the agent process group. The process is frozen — it cannot modify its in-memory state, spin up threads, or interfere with checkpoint serialization.
+3. **Terminate the agent process** (≤ 50 ms). SIGKILL — no cleanup handlers, no graceful shutdown. (If checkpointing is enabled, SIGKILL is deferred until Phase 2 Step 4 completes or times out.)
 
-**R-SEV-003:** Steps 1 and 4 are MANDATORY. Steps 2, 3, 5, and 6 are MANDATORY for Enterprise and Sovereign tiers. For Foundation tier, steps 2, 3, 5, and 6 are RECOMMENDED.
+**Phase 2 — Completion (post-severance, best-effort):**
 
-**R-SEV-004:** If any step after Step 1 fails or exceeds its latency budget, the system MUST proceed with subsequent steps. Step 1 (token revocation) is the point of no return — once tokens are revoked, the agent is dead regardless of whether state serialization succeeds.
+4. **Serialize cognitive state** from the frozen process (≤ 500 ms). Capture the agent's current context, the pending tool call (if any), open connections, and process state. The process is frozen (SIGSTOP), so in-memory state is stable during serialization.
+5. **Terminate the frozen process** (≤ 50 ms). SIGKILL after checkpoint or on checkpoint timeout.
+6. **Commit state checkpoint to Merkle tree** (≤ 200 ms). The checkpoint is signed and chained to the audit trail.
+7. **Execute CoW rollback** (≤ 100 ms) if the agent was operating in a CoW environment (AOS-HARD-001 Section 6).
+8. **Write audit record** (≤ 200 ms). Final journal entry with kill event, trigger, checkpoint hash, and operator signature.
+
+**R-SEV-003:** Phase 1 steps (1, 2, 3) and Phase 2 step 8 (audit record) are MANDATORY for ALL tiers. Phase 2 steps 4, 5, 6, and 7 are MANDATORY for Enterprise and Sovereign tiers, RECOMMENDED for Foundation tier. If checkpointing is enabled, Step 3 (immediate SIGKILL) is deferred — the process remains frozen (SIGSTOP) until Step 4 completes or times out, then Step 5 kills it.
+
+**R-SEV-004:** If any Phase 2 step fails or exceeds its latency budget, the system MUST proceed with subsequent steps. Phase 1 Step 1 (token revocation) is the point of no return — once tokens are revoked, the agent is dead regardless of whether state serialization succeeds.
 
 ### 6.3 Tier 2: Cluster-Level Severance
 
@@ -344,6 +366,10 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 
 **R-SEV-006:** If any node fails to acknowledge severance within 5 seconds, the cluster orchestrator MUST escalate to Tier 3 (Global) or Tier 4 (Physical) for the unresponsive node. A node that does not confirm kill is assumed compromised.
 
+**R-SEV-013:** For clusters containing more than 5 agents, Tier 2 severance MUST require multi-party authorization (at least two independent operators). For clusters of 5 or fewer agents, single-operator authorization is sufficient. This prevents a single compromised operator credential from terminating an entire production environment.
+
+**R-SEV-014:** Cluster membership MUST be defined in the DPG's policy configuration, NOT by the agent. The agent MUST NOT have the ability to read, modify, or remove its cluster assignment. Cluster membership changes MUST be signed by an authorized operator and committed to the audit trail.
+
 ### 6.4 Tier 3: Global-Level Severance
 
 **R-SEV-007:** Global-level severance terminates execution authority for ALL agents across the entire system. This is a system-wide emergency stop.
@@ -351,6 +377,8 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 **R-SEV-008:** Global severance MUST require multi-party authorization: at least two independent operators MUST sign the kill signal. This prevents a single compromised operator account from shutting down the entire system.
 
 **R-SEV-009:** Global severance MUST propagate to all nodes within 30 seconds. Nodes that cannot be reached over the network MUST have local watchdog timers that trigger automatic kill if the global heartbeat is lost (defense against network partition hiding a compromised node).
+
+**R-SEV-015:** Tier 3 propagation SHOULD prioritize agents by risk level: (1) Sovereign-tier agents with physical actuator access (embodied AI), (2) Sovereign-tier software agents, (3) Enterprise-tier agents, (4) Foundation-tier agents. Within each priority level, agents SHOULD be killed in parallel.
 
 ### 6.5 Tier 4: Physical-Layer Severance
 
@@ -364,6 +392,19 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 - All software-based kill mechanisms have failed or are untrusted
 
 **R-SEV-012:** Tier 4 severance MUST require both multi-party authorization AND physical presence at the hardware (for Sovereign tier, per AOS-HARD-001 R-HW-008). Remote-only Tier 4 activation is prohibited for Sovereign deployments.
+
+### 6.6 GRACEFUL Severance Mode
+
+**R-SEV-016:** When the kill signal specifies `urgency: GRACEFUL`, the system MUST allow the agent to complete its currently executing tool call (if any) before initiating the severance procedure. GRACEFUL mode operates as follows:
+
+1. The DPG sets a GRACEFUL flag in the signal store. New tool calls are blocked (`EXECUTION_SEVERED`), but the currently executing tool call is allowed to complete.
+2. A configurable timeout begins (default: 30 seconds). If the current tool call does not complete within this timeout, the system MUST auto-escalate to `IMMEDIATE` and execute the standard severance procedure (R-SEV-002).
+3. Once the current tool call completes (or the timeout fires), the system executes the full severance procedure.
+4. The audit record MUST note the urgency mode, the tool call that was allowed to complete (if any), and whether auto-escalation occurred.
+
+GRACEFUL mode is RECOMMENDED for `MAINTENANCE` reason codes and OPTIONAL for `OPERATOR_OVERRIDE`. It MUST NOT be used for `SAFETY_CRITICAL`, `TRAJECTORY_ANOMALY`, `CONTEXT_POISONING`, or `EXTERNAL_THREAT` — these reason codes MUST always use IMMEDIATE.
+
+> **Note:** GRACEFUL does not mean the agent gets a warning or a chance to negotiate. It means one in-progress tool call is allowed to finish. The agent still cannot submit NEW tool calls. If the in-progress call doesn't finish in time, it is killed.
 
 ---
 
@@ -401,6 +442,14 @@ Cognitive Checkpoint Structure:
       "arguments": "<structured arguments>",
       "dpg_decision": "EXECUTION_SEVERED"
     },
+    "recent_tool_calls": [
+      {
+        "tool": "<tool name>",
+        "arguments_hash": "<SHA-256 of arguments>",
+        "dpg_decision": "<ALLOW|DENY|ESCALATE>",
+        "timestamp": "<ISO 8601>"
+      }
+    ],
     "pending_approvals": ["<list of pending ESCALATE challenges>"],
     "open_connections": ["<list of open network connections>"],
     "active_cow_layers": ["<list of active CoW upper layers>"]
@@ -418,13 +467,16 @@ Cognitive Checkpoint Structure:
 
 ### 7.3 Checkpoint Timing
 
-**R-CHK-002:** The checkpoint MUST be captured AFTER execution tokens are revoked (R-SEV-002 Step 1) but BEFORE the process is terminated (R-SEV-002 Step 4). This ensures:
+**R-CHK-002:** The checkpoint MUST be captured AFTER execution tokens are revoked AND the process is frozen (R-SEV-002 Phase 1, Steps 1-2) but BEFORE the process is terminated (R-SEV-002 Phase 2, Step 5). This ensures:
 
-1. The agent cannot execute any more actions while the checkpoint is being taken
-2. The agent's in-memory state is still accessible for serialization
-3. The checkpoint captures the exact state at the moment of kill, not a stale snapshot
+1. The agent cannot execute any more actions (tokens revoked)
+2. The agent cannot modify its in-memory state (process frozen via SIGSTOP)
+3. The agent's in-memory state is still accessible for serialization (process not yet killed)
+4. The checkpoint captures the exact state at the moment of kill, not a stale or corrupted snapshot
 
-**R-CHK-003:** If the checkpoint cannot complete within 500 milliseconds, the system MUST proceed with process termination and retain whatever partial checkpoint was captured. The partial checkpoint MUST be marked with `"complete": false` in the audit record.
+**R-CHK-003:** If the checkpoint cannot complete within 500 milliseconds, the system MUST proceed with process termination (SIGKILL) and retain whatever partial checkpoint was captured. The partial checkpoint MUST be marked with `"complete": false` in the audit record.
+
+**R-CHK-006:** Before initiating checkpoint serialization, the system MUST freeze the agent process using SIGSTOP (or platform equivalent). The process MUST be frozen, not merely token-revoked, to prevent in-memory state modification during serialization. This eliminates the TOCTOU race between the serializer's reads and potential agent writes. Process termination (SIGKILL) occurs AFTER the checkpoint completes or times out.
 
 ### 7.4 Checkpoint Storage
 
@@ -638,7 +690,7 @@ Kill Event Audit Record:
 | **AOS-POL-001** | Policy may define automated kill conditions (e.g., kill on N consecutive DENY events). |
 | **AOS-CRYPTO-001** | Cryptographic standards for signal authentication, checkpoint encryption, and Merkle tree construction. |
 | **AOS-FORMAL-001** | Formal verification of the kill switch's liveness property (the kill ALWAYS fires when triggered). |
-| **EU AI Act Art. 14** | Requires human oversight and ability to intervene. CORE-002 provides the mechanism. |
+| **EU AI Act Art. 14** (Regulation (EU) 2024/1689) | Requires human oversight and ability to intervene. CORE-002 provides the mechanism. |
 | **NIST AI RMF** | Aligns with the "Govern" and "Manage" functions for AI risk management. |
 
 ---
