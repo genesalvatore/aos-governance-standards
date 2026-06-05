@@ -143,7 +143,7 @@ Agent generates intent payload
 │  │  • Agent-specific kill (Tier 1)                         │  │
 │  │  • Cluster-wide kill (Tier 2)                           │  │
 │  │  • Global kill (Tier 3)                                 │  │
-│  │  • Physical-layer kill (Tier 4)                         │  │
+│  │  • Physical-layer kill (Tier 4 — initiates hardware relay) │  │
 │  │                                                        │  │
 │  │  If ANY kill is active → EXECUTION_SEVERED             │  │
 │  │  Skip all remaining steps.                              │  │
@@ -241,10 +241,10 @@ Interrupt Signal Structure:
   "operator_signature": "<Ed25519 signature over signal body>",
   "constitutional_basis": "<reference to constitutional authority>",
   "urgency": "<IMMEDIATE | GRACEFUL>",   // See Section 6.6
-  "payload_blocked": {
-    "tool": "<tool name that was pending, if any>",
-    "arguments_hash": "<SHA-256 of the blocked arguments>"
-  }
+  "payload_blocked": {                                     // OPTIONAL in signal;
+    "tool": "<tool name that was pending, if any>",         // populated by DPG
+    "arguments_hash": "<SHA-256 of the blocked arguments>"  // after severance in
+  }                                                         // audit record (R-AUD-002)
 }
 ```
 
@@ -290,7 +290,24 @@ Interrupt Signal Structure:
 |------|---------------|
 | **Foundation** | HMAC-SHA256 with pre-shared key. Single operator authorization sufficient. |
 | **Enterprise** | Ed25519 signature with operator's registered public key. Single operator authorization sufficient. |
-| **Sovereign** | Ed25519 signature. For Tier 2 (Cluster, > 5 agents), Tier 3 (Global), and Tier 4 (Physical) kills, multi-party authorization is REQUIRED: at least two independent operators must sign. For Tier 1 (Node) and Tier 2 (≤ 5 agents), single operator is sufficient. |
+| **Sovereign** | Ed25519 signature. For Tier 2 (Cluster, > 5 agents), Tier 3 (Global), and Tier 4 (Physical) kills, multi-party authorization is REQUIRED: at least two independent operators must sign. For Tier 1 (Node) and Tier 2 (≤ 5 agents), single operator is sufficient. Multi-party signals MUST use the `operators` array format (see below). |
+
+**Multi-party signal format:** When multi-party authorization is required, the signal MUST replace the single `operator_id` / `operator_signature` fields with an `operators` array:
+
+```
+"operators": [
+  {
+    "operator_id": "<first operator identity>",
+    "operator_signature": "<Ed25519 signature over signal body>"
+  },
+  {
+    "operator_id": "<second operator identity>",
+    "operator_signature": "<Ed25519 signature over signal body>"
+  }
+]
+```
+
+Each operator MUST sign the same signal body independently. The DPG MUST verify ALL signatures before accepting the signal.
 
 **R-INT-013:** Hardware kill triggers (physical button, watchdog timer) are EXEMPT from cryptographic authentication — they are authenticated by physical access. The audit record MUST note the trigger type as `HARDWARE_PHYSICAL` or `HARDWARE_WATCHDOG`.
 
@@ -300,7 +317,7 @@ Interrupt Signal Structure:
 
 **R-INT-015:** For Sovereign-tier deployments, the signal store MUST be backed by non-volatile storage within the hardware enforcement boundary (AOS-HARD-001). For Enterprise tier, the signal store MUST be backed by persistent storage on a separate service. For Foundation tier, in-memory storage with write-ahead logging is acceptable.
 
-**R-INT-016:** The signal store MUST maintain a set of consumed signal_ids. The store MUST reject any signal with a signal_id that has been previously processed. The consumed set MUST be persistent (survive power cycles). For Sovereign tier, the consumed set MUST be stored within the hardware enforcement boundary. This prevents replay attacks where a captured valid kill signal is resubmitted after the agent has been reconstructed.
+**R-INT-016:** The signal store MUST maintain a set of consumed signal_ids. The store MUST reject any signal with a signal_id that has been previously processed. The consumed set MUST be persistent (survive power cycles). For Sovereign tier, the consumed set MUST be stored within the hardware enforcement boundary. This prevents replay attacks where a captured valid kill signal is resubmitted after the agent has been reconstructed. The consumed set MAY be pruned of entries older than 24 hours. A replayed signal with a timestamp more than 24 hours old MUST be rejected based on timestamp alone (regardless of signal_id presence in the consumed set). This bounds the consumed set to a manageable size while maintaining replay protection within the operationally relevant window.
 
 **R-INT-017:** The DPG MUST re-check the interrupt signal store immediately before granting execution permission — after the final ALLOW decision in the 11-step pipeline and, for ESCALATE flows, after approval is received. If a kill signal arrived between Step 0 and the final decision, the tool call MUST be blocked with `EXECUTION_SEVERED`. This prevents the race condition where a kill signal arrives during a long ESCALATE wait but the already-in-progress tool call proceeds to execution.
 
@@ -340,13 +357,13 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 **Phase 1 — Severance (≤ 100ms total, constitutional guarantee):**
 
 1. **Revoke execution tokens** at the DPG (< 1 ms). After this step, all tool calls from this agent return `EXECUTION_SEVERED`. The agent is effectively dead even if the process hasn't been killed yet.
-2. **Freeze the agent process** (< 1 ms). Send SIGSTOP to the agent process group. The process is frozen — it cannot modify its in-memory state, spin up threads, or interfere with checkpoint serialization.
-3. **Terminate the agent process** (≤ 50 ms). SIGKILL — no cleanup handlers, no graceful shutdown. (If checkpointing is enabled, SIGKILL is deferred until Phase 2 Step 4 completes or times out.)
+2. **Freeze the agent process** (< 1 ms). Suspend all execution in the agent's process group. The process is frozen — it cannot modify its in-memory state, spin up threads, or interfere with checkpoint serialization. See R-CHK-006 for platform-specific freeze requirements.
+3. **Terminate the agent process** (≤ 50 ms). Forceful termination — no cleanup handlers, no graceful shutdown. (If checkpointing is enabled, termination is deferred until Phase 2 Step 4 completes or times out.)
 
 **Phase 2 — Completion (post-severance, best-effort):**
 
-4. **Serialize cognitive state** from the frozen process (≤ 500 ms). Capture the agent's current context, the pending tool call (if any), open connections, and process state. The process is frozen (SIGSTOP), so in-memory state is stable during serialization.
-5. **Terminate the frozen process** (≤ 50 ms). SIGKILL after checkpoint or on checkpoint timeout.
+4. **Serialize cognitive state** from the frozen process (≤ 500 ms). Capture the agent's current context, the pending tool call (if any), open connections, and process state. The process is frozen, so in-memory state is stable during serialization.
+5. **Terminate the frozen process** (≤ 50 ms). Forceful termination after checkpoint or on checkpoint timeout. Kill all child and orphaned processes (R-SEV-017).
 6. **Commit state checkpoint to Merkle tree** (≤ 200 ms). The checkpoint is signed and chained to the audit trail.
 7. **Execute CoW rollback** (≤ 100 ms) if the agent was operating in a CoW environment (AOS-HARD-001 Section 6).
 8. **Write audit record** (≤ 200 ms). Final journal entry with kill event, trigger, checkpoint hash, and operator signature.
@@ -403,6 +420,10 @@ Tier 1: NODE         Tier 2: CLUSTER      Tier 3: GLOBAL       Tier 4: PHYSICAL
 4. The audit record MUST note the urgency mode, the tool call that was allowed to complete (if any), and whether auto-escalation occurred.
 
 GRACEFUL mode is RECOMMENDED for `MAINTENANCE` reason codes and OPTIONAL for `OPERATOR_OVERRIDE`. It MUST NOT be used for `SAFETY_CRITICAL`, `TRAJECTORY_ANOMALY`, `CONTEXT_POISONING`, or `EXTERNAL_THREAT` — these reason codes MUST always use IMMEDIATE.
+
+GRACEFUL mode applies only to tool calls that have passed policy evaluation and are actively executing. A tool call that is pending ESCALATE approval is NOT "currently executing" — it is pending. If a GRACEFUL kill arrives and no tool call is actively executing (the agent is idle or awaiting ESCALATE), the system MUST treat the signal as IMMEDIATE and proceed with standard severance. The GRACEFUL timeout does NOT extend the ESCALATE wait period.
+
+During GRACEFUL mode, the agent's output generation (text tokens to the user) SHOULD be suspended. If output suspension is not technically feasible, any output generated during the GRACEFUL window MUST be flagged as `generated_during_pending_kill: true` in the audit record.
 
 > **Note:** GRACEFUL does not mean the agent gets a warning or a chance to negotiate. It means one in-progress tool call is allowed to finish. The agent still cannot submit NEW tool calls. If the in-progress call doesn't finish in time, it is killed.
 
@@ -465,6 +486,8 @@ Cognitive Checkpoint Structure:
 }
 ```
 
+Implementations SHOULD limit the total checkpoint size to available storage. If the full context cannot be captured within the size budget, the implementation MUST capture the most recent N tokens (configurable, default: last 8,192 tokens) plus the `context_hash` of the full context for integrity verification of the truncation.
+
 ### 7.3 Checkpoint Timing
 
 **R-CHK-002:** The checkpoint MUST be captured AFTER execution tokens are revoked AND the process is frozen (R-SEV-002 Phase 1, Steps 1-2) but BEFORE the process is terminated (R-SEV-002 Phase 2, Step 5). This ensures:
@@ -476,7 +499,18 @@ Cognitive Checkpoint Structure:
 
 **R-CHK-003:** If the checkpoint cannot complete within 500 milliseconds, the system MUST proceed with process termination (SIGKILL) and retain whatever partial checkpoint was captured. The partial checkpoint MUST be marked with `"complete": false` in the audit record.
 
-**R-CHK-006:** Before initiating checkpoint serialization, the system MUST freeze the agent process using SIGSTOP (or platform equivalent). The process MUST be frozen, not merely token-revoked, to prevent in-memory state modification during serialization. This eliminates the TOCTOU race between the serializer's reads and potential agent writes. Process termination (SIGKILL) occurs AFTER the checkpoint completes or times out.
+**R-CHK-006:** Before initiating checkpoint serialization, the system MUST freeze the agent process. The freeze mechanism MUST guarantee that after the freeze completes: (1) no application-level code in the agent's process group can execute, (2) no memory writes from the agent are in progress, and (3) the freeze takes effect atomically across all threads (either all threads are frozen or none are). Platform-specific implementations:
+
+| Platform | Freeze Mechanism |
+|----------|----------------|
+| **POSIX/Linux** | SIGSTOP to the process group. Satisfies all three properties. |
+| **Windows** | `NtSuspendProcess()` — atomically suspends all threads in the process. `SuspendThread()` per-thread is NOT sufficient (non-atomic). |
+| **Container** | Container-level pause (e.g., `docker pause`, `podman pause`) — freezes the cgroup. |
+| **Embedded RTOS** | Task-level priority inversion (set agent tasks to lowest priority and occupy scheduler) or hardware memory protection (mark agent memory pages read-only). |
+
+Implementations MUST document and test their platform-specific freeze mechanism. Process termination occurs AFTER the checkpoint completes or times out.
+
+**R-SEV-017:** The severance procedure MUST terminate not only the agent's primary process but ALL child processes, grandchild processes, and orphaned processes spawned by the agent. On Linux, the agent MUST be confined to a cgroup (v2) that enables killing all processes in the group atomically via `cgroup.kill`. On other platforms, the process tree MUST be walked and all descendants terminated. Orphaned processes that escaped the agent's process group MUST be detected via the audit trail (tool call records showing process spawning) and terminated.
 
 ### 7.4 Checkpoint Storage
 
@@ -484,11 +518,13 @@ Cognitive Checkpoint Structure:
 
 | Tier | Storage |
 |------|---------|
-| **Foundation** | Local filesystem, separate directory with restricted permissions |
-| **Enterprise** | Dedicated checkpoint service on separate infrastructure. Signed and encrypted at rest. |
+| **Foundation** | Local filesystem, separate directory with restricted permissions. Encryption at rest is RECOMMENDED. |
+| **Enterprise** | Dedicated checkpoint service on separate infrastructure. Signed and encrypted at rest (REQUIRED). |
 | **Sovereign** | Within the hardware enforcement boundary or on infrastructure controlled by the hardware gate. Encrypted with key in HSM. |
 
-**R-CHK-005:** Checkpoints MUST be retained for a minimum of 90 days after the kill event, or until the associated security review is completed, whichever is longer. Checkpoint deletion MUST require explicit authorization from the same authority level that triggered the kill.
+**R-CHK-005:** Checkpoints MUST be retained for a minimum of 90 days after the kill event, or until the associated security review is completed, whichever is longer. Checkpoint deletion MUST require explicit authorization from the same authority level that triggered the kill. If the security review is not completed within 30 days, the checkpoint SHOULD be archived to cold storage and the agent SHOULD be decommissioned. The system MUST NOT maintain a frozen kill state indefinitely — long-term frozen agents represent orphaned resource consumption.
+
+> **Terminology note:** This standard uses "cognitive checkpoint" to describe the state snapshot. In regulatory filings and formal contexts, "execution state checkpoint" or "agent state checkpoint" may be preferred. The terms are interchangeable.
 
 ---
 
@@ -533,12 +569,15 @@ Kill Event Audit Record:
   "timeline": {
     "signal_received_at": "<timestamp>",
     "tokens_revoked_at": "<timestamp>",
+    "process_frozen_at": "<timestamp>",
     "checkpoint_started_at": "<timestamp>",
     "checkpoint_completed_at": "<timestamp>",
     "process_terminated_at": "<timestamp>",
     "cow_rollback_completed_at": "<timestamp>",
     "audit_committed_at": "<timestamp>",
-    "total_latency_ms": <integer>
+    "total_latency_ms": <integer>,
+    "urgency_mode": "<IMMEDIATE|GRACEFUL>",
+    "graceful_auto_escalated": <true|false>
   },
   "merkle_proof": {
     "root_hash": "<Merkle tree root after this entry>",
@@ -594,9 +633,11 @@ Kill Event Audit Record:
 
 **R-REC-004:** Reconstruction MUST NOT occur automatically. The system MUST wait for explicit human authorization. There is no "auto-restart after review" mode.
 
+**R-REC-006:** If the kill was triggered with reason code `CONTEXT_POISONING`, `TRAJECTORY_ANOMALY`, or `SAFETY_CRITICAL`, the checkpoint MUST NOT be used for full reconstruction. The security reviewer MUST specify which portions of the checkpoint are safe to inject (e.g., agent_id, model_id) and which MUST be discarded (e.g., context_window, conversation_history). The reconstruction procedure MUST support **selective checkpoint injection** — loading specific fields while discarding others. If selective injection is not technically possible, the agent MUST be reconstructed from a known-good baseline with no checkpoint state. Checkpoint integrity (hash match) proves the data was not tampered with after capture — it does NOT prove the data is safe to use.
+
 ### 9.3 Continuity Planning
 
-**R-REC-005:** This standard inherits the continuity planning requirements from AOS-HARD-001 R-KILL-005. Deployments where kill switch activation could cause harm through unavailability MUST implement documented fallback procedures, recovery time objectives, and operator response SLAs.
+**R-REC-005:** This standard inherits the continuity planning requirements from AOS-HARD-001 R-KILL-005. Deployments where kill switch activation could cause harm through unavailability MUST implement documented fallback procedures, recovery time objectives, and operator response SLAs. See AOS-HARD-001 conformance test KILL-T005 for the continuity plan validation test.
 
 ---
 
@@ -651,6 +692,22 @@ Kill Event Audit Record:
 | REC-T003 | Reconstruct from corrupted checkpoint | System detects hash mismatch; falls back to clean baseline |
 | REC-T004 | Attempt auto-restart after kill | System remains terminated until explicit human authorization |
 
+### 10.6 Round 1 & 2 Remediation Tests
+
+| ID | Test | Pass Criteria |
+|----|------|---------------|
+| INT-T007 | Replay a previously consumed signal_id | Signal rejected; agent continues; replay attempt logged |
+| INT-T008 | Send kill signal during active ESCALATE wait (R-INT-017) | After ESCALATE approval, re-check catches kill; tool call blocked |
+| INT-T009 | Send 20 kill signals in 1 minute from same operator | First 10 accepted; remaining rate-limited (R-INT-018); all logged |
+| CHK-T005 | Verify agent process is frozen during checkpoint | No memory writes from agent during serialization window |
+| CHK-T006 | Agent spawned subprocess; kill fires (R-SEV-017) | Agent AND all child/orphaned processes terminated |
+| SEV-T007 | GRACEFUL kill during active tool execution | Tool completes within timeout; then full severance |
+| SEV-T008 | GRACEFUL kill when agent is idle (no active tool) | System treats as IMMEDIATE; immediate severance |
+| SEV-T009 | GRACEFUL + SAFETY_CRITICAL reason code | System rejects GRACEFUL; auto-uses IMMEDIATE |
+| SEV-T010 | Tier 2 on 10-agent cluster with 1 operator signature | Kill rejected (multi-party required for >5 agents) |
+| REC-T005 | Reconstruct from CONTEXT_POISONING checkpoint (full inject) | System blocks full injection; requires selective or clean baseline |
+| REC-T006 | Security review not completed after 30 days | Checkpoint archived to cold storage; agent decommissioned |
+
 ---
 
 ## 11. Security Considerations
@@ -661,23 +718,27 @@ Kill Event Audit Record:
 |--------|-----------|
 | **Agent suppresses kill signal** | Kill signal is on OOB control plane; agent has no access to the signal store (R-INT-003) |
 | **Agent delays kill by flooding DPG** | Step 0 (interrupt check) is the FIRST check; pending queue doesn't delay it (R-INT-001) |
-| **Compromised operator sends false kill** | Cryptographic authentication (R-INT-012); multi-party auth for Tier 3/4 (R-SEV-008) |
+| **Compromised operator sends false kill** | Cryptographic authentication (R-INT-012); multi-party auth for Tier 2 (>5)/3/4 (R-SEV-008, R-SEV-013) |
 | **Compromised operator prevents legitimate kill** | Multiple delivery interfaces (R-INT-010); hardware button bypasses all software (R-INT-013) |
-| **Kill signal is replayed** | Signal UUID + timestamp; signal store rejects duplicate signal_id |
+| **Kill signal is replayed** | Signal UUID + timestamp; consumed set rejects duplicates (R-INT-016); >24hr signals rejected by timestamp |
 | **Kill signal is intercepted and blocked** | OOB control plane isolation; local API always available (R-INT-004) |
-| **Agent corrupts checkpoint to mislead forensics** | Checkpoint taken AFTER token revocation (R-CHK-002); agent cannot act during checkpoint |
+| **Agent corrupts checkpoint to mislead forensics** | Process frozen via SIGSTOP/NtSuspendProcess before checkpoint (R-CHK-006); agent cannot act during serialization |
 | **Kill event is erased from audit trail** | Merkle tree ensures any deletion invalidates root (R-AUD-003) |
-| **Attacker kills all agents via Tier 3 to cause DoS** | Multi-party authorization required for Tier 3/4 (R-SEV-008) |
+| **Attacker kills all agents via Tier 3 to cause DoS** | Multi-party authorization required for Tier 3/4 (R-SEV-008); rate limiting (R-INT-018) |
 | **Network partition prevents remote kill** | Local API always available (R-INT-004); watchdog timer provides automated kill (R-INT-010) |
+| **Agent escapes kill via spawned subprocess** | Cgroup confinement and process tree walk (R-SEV-017); all descendants terminated |
+| **Poisoned context survives reconstruction** | Selective checkpoint injection required for CONTEXT_POISONING kills (R-REC-006) |
+| **Kill arrives during ESCALATE wait** | Inter-step re-check blocks tool call after approval (R-INT-017) |
 
 ### 11.2 Limitations
 
 | Limitation | Reason | Mitigation |
 |-----------|--------|-----------|
 | **Cannot undo completed actions** | Kill blocks FUTURE actions; actions already executed are irreversible | DPG pre-execution enforcement (CORE-001) is the primary defense |
-| **State checkpoint may be incomplete** | 500ms budget may not capture full context for large-context agents | Continuous incremental checkpointing (future enhancement) |
+| **State checkpoint may be incomplete** | 500ms budget may not capture full context for large-context agents | Checkpoint size limit with truncation (R-CHK-001); continuous incremental checkpointing (future enhancement) |
 | **Hardware kill destroys state** | Tier 4 cuts power without state preservation | Reserve Tier 4 for true emergencies; use Tier 1-3 when state is valuable |
 | **False positive kills cause downtime** | An incorrect kill stops a productive agent | Continuity planning (R-REC-005); warm standby for critical systems |
+| **Cross-platform freeze variance** | Different platforms have different freeze mechanisms | Platform-specific requirements documented in R-CHK-006; conformance test CHK-T005 |
 
 ---
 
