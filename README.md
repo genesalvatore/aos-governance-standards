@@ -4,7 +4,7 @@
 
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC_BY_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 [![Patent: RF Covenant](https://img.shields.io/badge/Patent-Royalty_Free-green.svg)](RF-PATENT-COVENANT.md)
-[![Standards: 12](https://img.shields.io/badge/Standards-12-blue.svg)](#specification-library)
+[![Standards: 14](https://img.shields.io/badge/Standards-14-blue.svg)](#specification-library)
 
 ---
 
@@ -30,6 +30,8 @@ The key insight: **safety must not depend on the model's behavior.** AOS treats 
 | [AOS-HARD-001](AOS-HARD-001_v1.0.md) | Hardware Enforcement Boundary | 77.0 KB | Published v1.0 |
 | [AOS-SEC-001](AOS-SEC-001_v1.0.md) | Security Profile (OWASP/NIST/ATLAS) | 28.2 KB | Published v1.0 |
 | [AOS-REG-001](AOS-REG-001_v1.0.md) | EU AI Act Compliance Profile | 33.0 KB | Published v1.0 |
+| [AOS-PERSIST-001](AOS-PERSIST-001_v1.0.md) | Agent State Persistence | — | Published v1.0 |
+| [AOS-FORMAL-001](AOS-FORMAL-001_v1.0.md) | Formal Verification Specification | — | Published v1.0 |
 
 ### Supporting Documents
 
@@ -39,6 +41,7 @@ The key insight: **safety must not depend on the model's behavior.** AOS treats 
 | [CONTRIBUTING](CONTRIBUTING.md) | Contribution guidelines with DCO/CLA |
 | [GOVERNANCE](GOVERNANCE.md) | Foundation governance charter |
 | [OSCAL Catalog](oscal/aos-catalog.json) | Machine-readable compliance mappings |
+| [Reference Implementation](reference/) | TypeScript DPG with 43/43 TCK tests (Apache 2.0) |
 
 ---
 
@@ -49,7 +52,9 @@ The key insight: **safety must not depend on the model's behavior.** AOS treats 
 1. Start with [AOS-CORE-001](AOS-CORE-001_v1.0.md) — the DPG specification
 2. Read [AOS-LANG-001](AOS-LANG-001_v1.0.md) — the policy language your gate consumes
 3. Implement the [AOS-API-001](AOS-API-001_v1.0.md) endpoints
-4. Run the conformance tests
+4. Run the conformance tests (see [reference/](reference/) for the 43-test TCK)
+5. Add state persistence ([AOS-PERSIST-001](AOS-PERSIST-001_v1.0.md))
+6. Optional: formal verification ([AOS-FORMAL-001](AOS-FORMAL-001_v1.0.md))
 
 ### For Policy Authors
 
