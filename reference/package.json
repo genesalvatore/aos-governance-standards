@@ -1,0 +1,51 @@
+{
+  "name": "@aos-governance/reference-gate",
+  "version": "1.0.0",
+  "description": "AOS Reference DPG Implementation — Deterministic Policy Gate conforming to AOS-CORE-001 v1.0",
+  "license": "Apache-2.0",
+  "author": "AOS Foundation",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "aos-validate": "dist/cli/validate.js",
+    "aos-lint": "dist/cli/lint.js",
+    "aos-tck": "dist/cli/tck.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --config jest.config.js",
+    "test:tck": "node --experimental-vm-modules node_modules/.bin/jest --config jest.config.js --testPathPattern=tck",
+    "lint": "tsc --noEmit",
+    "validate": "node dist/cli/validate.js",
+    "start": "node dist/api/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "ai-governance",
+    "deterministic-policy-gate",
+    "dpg",
+    "aos",
+    "agent-safety",
+    "llm-safety"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aos-governance/reference-gate"
+  }
+}
