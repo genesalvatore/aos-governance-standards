@@ -77,6 +77,10 @@ This standard is designed for deployments where:
 4. The cost of a false ALLOW exceeds the cost of hardware enforcement infrastructure
 5. Formal verification of the gate logic is required (hardware gates are more amenable to formal verification than software gates)
 
+### 1.5 Implementation Status
+
+> **NOTE:** As of v1.0, no commercial hardware product implements the AOS hardware gate. This standard defines requirements for future implementations. The normative requirements are designed to be testable against FPGA prototypes. A software emulation conformance profile (validating protocol and logic without hardware isolation) is a planned deliverable to enable development and testing prior to hardware availability. The expected development path is: software emulation → FPGA prototype → ASIC production.
+
 ---
 
 ## 2. Normative References
@@ -89,6 +93,11 @@ This standard is designed for deployments where:
 - **NIST SP 800-155** — BIOS Integrity Measurement Guidelines
 - **TCG TPM 2.0** — Trusted Platform Module Library Specification
 - **IEEE 1149.1** — JTAG Boundary Scan (for hardware verification)
+- **RFC 2119** — Key words for use in RFCs to Indicate Requirement Levels
+
+### 2.1 Conventions
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
 ---
 
@@ -177,12 +186,14 @@ Terms defined in AOS-CORE-001 Section 3 apply. Additional terms:
 | **Hardware gate (FPGA/ASIC)** | **Hardware-trusted** | Enforcement logic is in silicon. Cannot be modified by software. Firmware updates require physical access or signed bitstream with key in HSM. |
 | **HSM/TPM** | **Hardware-trusted** | Keys never leave the hardware module. Cryptographic operations occur inside the HSM. |
 | **Hardware kill switch** | **Physics-trusted** | Physical relay. Does not depend on software, OS, or network. |
-| **Syscall trajectory monitor** | **Kernel-trusted** | Runs in kernel space via eBPF. Agent cannot modify eBPF programs without CAP_BPF (denied by policy). |
 | **CoW filesystem layer** | **Kernel-trusted** | OverlayFS/Btrfs managed by kernel. Agent writes to upper layer only. Rollback is kernel operation. |
-| **OS kernel** | **Partially trusted** | The kernel manages CoW and eBPF, but the hardware gate does NOT depend on kernel integrity for enforcement decisions. |
+| **Syscall trajectory monitor** | **Kernel-trusted (defense-in-depth)** | Runs in kernel space via eBPF. Detects compromised AGENTS but does NOT protect against compromised KERNELS. If the kernel is compromised, the syscall monitor is compromised. This layer is a defense-in-depth complement, not a hardware-trust guarantee. |
+| **OS kernel** | **Partially trusted** | The kernel manages CoW, eBPF, and process isolation. The hardware gate does NOT depend on kernel integrity for enforcement decisions. However, the syscall trajectory monitor (Section 7) DOES depend on kernel integrity. |
 | **Agent process** | **UNTRUSTED** | Same as AOS-CORE-001 Axiom 1. |
 
 Key difference from AOS-CORE-001: In the software-only architecture, the kernel is **fully trusted** (it enforces process isolation). In AOS-HARD-001, the kernel is **partially trusted** — it manages execution environments but the enforcement decision is made in hardware that the kernel cannot influence.
+
+> **IMPORTANT — Defense-in-Depth Trust Boundaries:** The four enforcement layers in this standard operate at three different trust levels. The hardware gate and kill switch are hardware-trusted (survive kernel compromise). The CoW layer is kernel-trusted (survives agent compromise but not kernel compromise). The syscall monitor is kernel-trusted defense-in-depth (catches compromised agents through behavioral analysis but is itself defeated by kernel compromise). The standard's security guarantee degrades gracefully: even if the kernel is fully compromised, the hardware gate still enforces policy and the kill switch still works. The syscall monitor and CoW layers provide additional defense when the kernel is intact.
 
 ### 4.3 Hardware Communication Protocol
 
@@ -193,10 +204,12 @@ The hardware gate communicates with the agent host through a defined message pro
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                   GATE REQUEST MESSAGE                      │
-├──────────┬──────────┬──────────┬───────────────────────────┤
-│ Msg ID   │ Msg Type │ Length   │ Payload (CBOR-encoded)    │
-│ (8 bytes)│ (1 byte) │ (4 bytes)│ (variable)                │
-├──────────┼──────────┼──────────┼───────────────────────────┤
+├──────────┬──────────┬──────────┬──────────┬────────────────┤
+│ Version  │ Msg ID   │ Msg Type │ Seq Num  │ Length         │
+│ (1 byte) │ (8 bytes)│ (1 byte) │ (8 bytes)│ (4 bytes)      │
+├──────────┴──────────┴──────────┴──────────┴────────────────┤
+│ Payload (CBOR-encoded, variable length)                     │
+├────────────────────────────────────────────────────────────┤
 │ HMAC-SHA256 Authentication Tag (32 bytes)                   │
 └────────────────────────────────────────────────────────────┘
 
@@ -226,11 +239,15 @@ Decision Codes:
   0x03 = ERROR    (gate internal failure → fail-closed)
 ```
 
-**R-HW-010:** All messages between the agent host and the hardware gate MUST be authenticated using HMAC-SHA256 with a key derived from a shared secret established during measured boot. The gate MUST reject any message with an invalid or missing HMAC.
+**R-HW-010:** All messages between the agent host and the hardware gate MUST be authenticated using HMAC-SHA256 with a key derived from a shared secret established during measured boot. The host-side session key MUST be held in a TPM or separate secure element on the host — NOT in kernel memory. The gate driver MUST use the host TPM to compute HMACs without exposing the key material to software. The gate MUST reject any message with an invalid or missing HMAC.
 
-**R-HW-011:** The hardware gate MUST process messages sequentially in the order received. Concurrent request interleaving is NOT permitted. If the gate receives a new EVALUATE request while processing a prior request, it MUST queue the new request (up to a configurable queue depth, default: 16) or reject it with a BUSY response.
+**R-HW-011:** The hardware gate MUST process messages sequentially in the order received. Concurrent request interleaving is NOT permitted. If the gate receives a new EVALUATE request while processing a prior request, it MUST queue the new request (up to a configurable queue depth, default: 16) or reject it with a BUSY response. The gate MUST implement per-source rate limiting (default: 100 messages/second per agent identity) to prevent queue exhaustion attacks.
 
 **R-HW-012:** The gate MUST respond to every EVALUATE request within the latency budget (see Section 4.5). If the gate cannot complete evaluation within the budget, it MUST return a DENY decision with reason `TIMEOUT_FAIL_CLOSED`.
+
+**R-HW-020:** Every message MUST include a protocol version byte (currently `0x01`) and a monotonically increasing 64-bit sequence number. The hardware gate MUST reject any message with a sequence number less than or equal to the last processed sequence number for that source identity. The sequence counter MUST be maintained in the hardware gate's non-volatile state and MUST NOT reset on power cycle. This prevents replay attacks where a captured valid message is resubmitted.
+
+**R-HW-021:** The hardware gate MUST maintain an independent watchdog timer. The syscall trajectory monitor (Section 7) MUST send periodic heartbeat messages (default: every 5 seconds) to the hardware gate. If the hardware gate does not receive a heartbeat for a configurable period (default: 15 seconds), the gate MUST assume the kernel is compromised and enter fail-closed mode. The watchdog is the hardware gate's only mechanism for detecting kernel compromise — the gate cannot otherwise observe kernel integrity.
 
 ### 4.4 Enforcement Walkthrough: Hardware Path
 
@@ -324,6 +341,75 @@ The journal entry is signed by the HSM and chained to the previous entry. The ch
 
 > **Note:** At no point in this sequence did any software on the agent's host participate in the enforcement decision. The kernel facilitated the PCIe communication, but the decision logic, the signing key, and the journal are all inside the hardware enforcement boundary.
 
+#### 4.4.2 Enforcement Walkthrough: ESCALATE Path (Human Approval)
+
+This walkthrough shows the ESCALATE → APPROVE → ALLOW path for tool calls requiring human authorization.
+
+**Scenario:** An agent attempts to execute a database migration — a high-risk operation requiring human approval per policy.
+
+```
+Tool call: execute_command
+Arguments:
+  command: "psql -f migration_v42.sql production_db"
+```
+
+**Step 1-3:** Same as DENY walkthrough — message authenticated, policy loaded.
+
+**Step 4: Policy evaluation reaches approval requirement**
+
+The gate evaluates the tool call and determines:
+- Tool `execute_command` is in allowlist ✅
+- Scope check passes (`psql` is in permitted executables) ✅
+- Category: `database_write` → approval_mode: `always` → **ESCALATE**
+
+**Step 5: Hardware gate issues ESCALATE with challenge**
+
+```
+Gate → Host: ESCALATE {
+  msg_id: 0x0000000000000043,
+  decision: 0x02,
+  challenge_nonce: "<random 32 bytes from gate's TRNG>",
+  challenge_digest: "sha256(msg_id + tool + arguments + nonce)",
+  tool_summary: "execute_command: psql migration on production_db",
+  timeout_seconds: 300,
+  signature: "<Ed25519 over full payload>"
+}
+```
+
+The `challenge_nonce` is generated by the hardware gate's true random number generator (TRNG). This nonce binds the approval to this specific request — a captured approval token cannot be reused for a different request.
+
+**Step 6: Human approves via hardware-bound credential**
+
+The operator reviews the escalation and approves using a FIDO2 hardware key (e.g., YubiKey). The approval system constructs an APPROVE message:
+
+```
+Host → Gate: APPROVE {
+  msg_id: 0x0000000000000043,
+  challenge_nonce: "<echoed from ESCALATE>",
+  challenge_digest: "<echoed from ESCALATE>",
+  approver_identity: "operator-jane@example.com",
+  fido2_assertion: "<FIDO2 authenticator assertion over challenge_digest>",
+  hmac: "<session HMAC>"
+}
+```
+
+**Step 7: Hardware gate verifies approval**
+
+The gate verifies:
+1. ✅ The `challenge_nonce` matches the one it generated (prevents cross-request reuse)
+2. ✅ The `challenge_digest` matches (prevents parameter substitution)
+3. ✅ The FIDO2 assertion is valid against the approver's registered public key
+4. ✅ The approver is authorized for this category (registered in policy)
+5. ✅ The approval arrived within the timeout period (300 seconds)
+
+If ALL checks pass: the gate issues ALLOW with an attestation that includes both the gate's signature AND the approval evidence.
+
+**Step 8: Timeout behavior**
+
+**R-HW-022:** If the hardware gate does not receive a valid APPROVE message within the configured timeout (default: 300 seconds), the ESCALATE MUST automatically resolve to DENY. The gate MUST write a journal entry recording the timeout. The agent MUST NOT be permitted to retry the same tool call without a new ESCALATE cycle.
+
+**R-HW-023:** Approval tokens MUST be single-use. The `challenge_nonce` in the APPROVE message MUST match the nonce generated for the specific ESCALATE. The gate MUST reject any APPROVE message with a nonce it did not generate or has already consumed.
+
 ### 4.5 Performance Requirements
 
 Hardware enforcement must be fast enough to be operationally viable. A gate that is correct but adds 500ms to every tool call will be bypassed in practice.
@@ -404,7 +490,7 @@ Sovereign-tier deployments may run multiple agents on a shared hardware infrastr
 - Dedicated FPGA connected via PCIe or dedicated bus
 - Dedicated ASIC on the system board
 - Dedicated co-processor with its own memory subsystem
-- Smartcard / secure element with enforcement logic
+- Smartcard / secure element with enforcement logic (NOTE: smartcard and secure element implementations are EXEMPTED from the P50/P99 latency requirements in Section 4.5 due to I/O bus constraints. Such implementations MUST define and publish their own latency targets appropriate to the I/O bus speed. These implementations are RECOMMENDED only for edge/IoT deployments where reduced throughput is acceptable.)
 
 **R-HW-002:** Communication between the agent host and the hardware gate MUST use a hardware channel that the agent cannot intercept, modify, or replay. The channel MUST provide:
 
@@ -437,8 +523,11 @@ Sovereign-tier deployments may run multiple agents on a shared hardware infrastr
 **R-HW-008:** Hardware gate firmware (FPGA bitstream or ASIC configuration) MUST be cryptographically signed by the manufacturer. Updates MUST require:
 
 - Signature verification against a key burned into the hardware at manufacture
-- Physical presence (e.g., physical jumper, button press) OR multi-party authorization from at least two independent key holders
+- **Sovereign tier:** Physical presence (e.g., physical jumper, button press) AND multi-party authorization from at least two independent key holders. Both are REQUIRED — remote-only update is prohibited.
+- **Enterprise tier:** Physical presence OR multi-party authorization from at least two independent key holders.
 - Journal entry recording the firmware version change, the old and new firmware hashes, and the authorization evidence
+
+**R-HW-024:** The hardware gate MUST maintain an internal real-time clock (RTC) or monotonic counter for journal timestamps. If the gate uses an RTC, the clock MUST be calibrated against an external time source (NTP or GPS) during initial provisioning and MUST maintain accuracy within ±1 second per day. If clock accuracy cannot be guaranteed, the gate MUST use monotonic sequence numbers instead of wall-clock timestamps for journal ordering. The hardware gate MUST NOT depend on the host's system clock (which is controlled by potentially compromised software).
 
 **R-HW-009:** The hardware gate MUST support firmware version attestation. External verifiers MUST be able to query the gate for its current firmware version and verify that version against a published reference hash.
 
@@ -623,6 +712,8 @@ mount -t overlay overlay \
 
 **R-COW-009:** The upper layer MUST be backed by `tmpfs` (RAM-based) for Sovereign-tier deployments. Disk-backed upper layers leave residue in unallocated blocks even after deletion. RAM-based upper layers are zeroed on unmount.
 
+**R-COW-013:** The CoW upper layer tmpfs MUST have a size limit enforced at mount time. The size limit MUST be configured relative to available system memory (RECOMMENDED: ≤ 25% of total RAM, maximum 8 GB). The implementation MUST monitor upper layer utilization and trigger atomic rollback if utilization exceeds 90% of the configured limit. This prevents a malicious agent from exhausting system memory via writes to the upper layer, which could cause OOM conditions affecting the syscall monitor, gate driver, or other critical host processes.
+
 ### 6.3 Commit Protocol
 
 **R-COW-004:** If a task completes successfully (all tool calls ALLOWED, all attestations verified), the upper layer modifications MAY be committed to the baseline through a controlled promotion process. Promotion MUST:
@@ -700,16 +791,30 @@ Concurrent task conflict resolution:
 
 **R-COW-012:** The rollback procedure MUST execute in the following order to prevent information leakage:
 
-1. **Kill all processes** in the agent's process group (SIGKILL, not SIGTERM — no cleanup handlers)
-2. **Close all file descriptors** held by agent processes
-3. **Terminate all network connections** (TCP RST, UDP close)
-4. **Destroy IPC artifacts** (shmdt, msgctl IPC_RMID, semctl IPC_RMID)
-5. **Unmount the CoW overlay** (umount -l for lazy unmount if busy)
-6. **Purge the upper layer directory** (rm -rf on tmpfs — instant)
-7. **Zero the tmpfs mount** (umount zeroes RAM pages)
-8. **Record rollback completion** in hardware journal
+1. **Kill all processes** in the agent's process group (SIGKILL, not SIGTERM — no cleanup handlers; kernel closes all FDs and releases all resources during process teardown)
+2. **Terminate all network connections** (TCP RST, UDP close — catch any connections not owned by killed processes, e.g., inherited by non-agent daemons)
+3. **Destroy IPC artifacts** (shmdt, msgctl IPC_RMID, semctl IPC_RMID)
+4. **Unmount the CoW overlay** (umount -l for lazy unmount if busy)
+5. **Purge the upper layer directory** (rm -rf on tmpfs — instant)
+6. **Zero the tmpfs mount** (umount zeroes RAM pages)
+7. **Record rollback completion** in hardware journal
 
 This requirement ensures that a denied agent session leaves no trace that could be exploited by subsequent sessions.
+
+### 6.6 Limitations of Filesystem Rollback
+
+> **WARNING:** CoW rollback reverses filesystem state ONLY. It does NOT reverse network side effects.
+
+The following actions are **NOT reversible** by CoW rollback:
+
+- **API calls already executed:** If the agent sent an HTTP request (email, webhook, Slack message, API mutation) before the denied tool call, the request has already been delivered. The filesystem is clean, but the external system received the data.
+- **Database writes via network:** Database transactions committed over a network connection are not affected by filesystem rollback.
+- **DNS queries:** DNS lookups reveal what the agent was investigating. This information leakage cannot be undone.
+- **Outbound data in URL parameters:** HTTP GET requests encode data in URLs, which are logged by proxies, firewalls, and destination servers.
+
+**Implication for policy design:** For operations with irreversible network side effects, the DPG's pre-execution enforcement (DENY or ESCALATE before the action executes) is the primary defense. CoW rollback is a secondary defense that protects filesystem state. It is NOT a substitute for correct policy.
+
+**Recommendation for Sovereign-tier deployments:** Network operations (any tool that initiates outbound connections) SHOULD require explicit human approval (`approval_mode: always`) to compensate for the inherent limitations of post-execution rollback. This is the only way to prevent irreversible side effects from an agent that passes policy on individual tool calls but is globally compromised.
 
 ---
 
@@ -786,7 +891,7 @@ Baseline model structure:
       "mean_velocity": 800,
       "stddev_velocity": 300,
       "max_burst": 2000,
-      "allowed_execve_targets": ["/usr/bin/git", "/usr/bin/npm"],
+      "observed_execve_targets": ["/usr/bin/git", "/usr/bin/npm"],
       "max_fork_depth": 3
     }
   },
@@ -796,13 +901,13 @@ Baseline model structure:
 
 #### 7.2.2 False Positive Handling
 
-**R-SYS-009:** The syscall trajectory monitor MUST distinguish between alert severity levels:
+**R-SYS-009:** The syscall trajectory monitor MUST distinguish between alert severity levels. Thresholds MUST be defined using distribution-agnostic percentiles computed during the training phase, NOT Gaussian assumptions (mean + Nσ), because syscall patterns are typically heavy-tailed:
 
 | Severity | Threshold | Response |
 |----------|-----------|----------|
-| **NOTICE** | Metric exceeds baseline mean + 2σ | Log only. No enforcement action. |
-| **WARNING** | Metric exceeds baseline mean + 3σ | Log + alert to operator. Agent continues. |
-| **CRITICAL** | Metric exceeds baseline maximum OR matches known malicious sequence | Log + alert + suspend agent. Hardware kill switch MAY activate. |
+| **NOTICE** | Metric exceeds baseline P95 | Log only. No enforcement action. |
+| **WARNING** | Metric exceeds baseline P99 | Log + alert to operator. Agent continues. |
+| **CRITICAL** | Metric exceeds baseline P99.9 OR matches known malicious sequence | Log + alert + suspend agent. Hardware kill switch MAY activate. |
 | **EMERGENCY** | Multiple CRITICAL indicators simultaneously OR monitoring system under attack | Hardware kill switch MUST activate immediately. |
 
 **R-SYS-010:** False positive events (operator-confirmed legitimate behavior that triggered an alert) MUST be recorded and used to refine the baseline during the next training phase. The baseline MUST NOT be automatically adjusted during runtime — adjustments require an explicit retraining cycle.
@@ -875,10 +980,11 @@ Interaction 49: (never reached)
 
 **R-KILL-002:** The hardware kill switch MUST be triggerable by:
 
-- The hardware gate (on policy violation or journal failure)
-- The syscall trajectory monitor (on baseline deviation)
+- The hardware gate (on policy violation, journal failure, or watchdog timeout)
 - An external physical control (button, switch, or remote relay)
-- A watchdog timer (if the hardware gate becomes unresponsive)
+- A watchdog timer within the hardware gate (if the gate itself becomes unresponsive)
+
+The syscall trajectory monitor (Section 7) does NOT directly trigger the kill switch. The monitor reports anomalies to the hardware gate via heartbeat messages (R-HW-021), and the hardware gate decides whether to activate the kill switch. This ensures that kill switch activation never depends on kernel integrity — only the hardware gate and physical controls can trigger it.
 
 ### 8.2 State Preservation on Kill
 
